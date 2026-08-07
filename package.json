@@ -1,0 +1,43 @@
+{
+  "name": "omp-code-review",
+  "version": "0.1.0",
+  "description": "Interactive local code review extension for Oh My Pi",
+  "type": "module",
+  "author": "anatoli-tsinovoy",
+  "license": "MIT",
+  "homepage": "https://github.com/anatoli-tsinovoy/omp-code-review",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anatoli-tsinovoy/omp-code-review.git"
+  },
+  "keywords": [
+    "oh-my-pi",
+    "omp",
+    "extension",
+    "code-review"
+  ],
+  "omp": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "bun test",
+    "check": "prettier --check . && bun run typecheck",
+    "typecheck": "tsgo -p tsconfig.json --noEmit",
+    "format": "bunx prettier --write ."
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": ">=17.2.9",
+    "@oh-my-pi/pi-tui": ">=17.2.9",
+    "@oh-my-pi/pi-utils": ">=17.2.9"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "^17.2.9",
+    "@oh-my-pi/pi-tui": "^17.2.9",
+    "@oh-my-pi/pi-utils": "^17.2.9",
+    "@typescript/native-preview": "^7.0.0-dev.20260306.1",
+    "@types/bun": "^1.3.14",
+    "prettier": "^3.9.5"
+  }
+}
