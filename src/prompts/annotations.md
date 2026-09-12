@@ -12,7 +12,15 @@ Use these annotations as review notes; they are not independently validated find
 
 {{#list annotations join="\n\n"}}
 
+{{#if isLine}}
+
 ### {{pathLabel}} — {{lineLabel}}
+
+{{else}}
+
+### {{pathLabel}} — file
+
+{{/if}}
 
 Path: `{{path}}`
 {{#if oldPath}}
@@ -23,11 +31,13 @@ New path: `{{newPath}}`
 {{/if}}
 Occurrence: `{{occurrence}}`
 
+{{#if isLine}}
 Hunk: `{{hunkHeader}}`
 
 {{#codeblock lang="diff"}}
 {{rawLine}}
 {{/codeblock}}
+{{/if}}
 
 {{note}}
 {{/list}}

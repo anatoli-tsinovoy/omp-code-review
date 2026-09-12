@@ -117,6 +117,24 @@ diff --git a/src/beta.ts b/src/beta.ts
     expect(render(overlay)).toContain("↑↓ line");
   });
 
+  it("keeps the selection gutter fixed while preserving diff markers", () => {
+    const overlay = makeOverlay(`diff --git a/src/value.ts b/src/value.ts
+--- a/src/value.ts
++++ b/src/value.ts
+@@ -1,2 +1,2 @@
+-old
++new`);
+
+    render(overlay);
+    overlay.handleInput(TAB);
+    const selected = render(overlay);
+    expect(selected).toContain(`${theme().nav.cursor} -   1 old`);
+    overlay.handleInput(DOWN);
+    const moved = render(overlay);
+    expect(moved).toContain("  -   1 old");
+    expect(moved).toContain(`${theme().nav.cursor} +   1 new`);
+  });
+
   it("anchors a scrolled annotation to its exact source row", () => {
     const rows = Array.from(
       { length: 80 },
@@ -137,6 +155,7 @@ diff --git a/src/beta.ts b/src/beta.ts
 
     expect(overlay.getAnnotations()).toEqual([
       expect.objectContaining({
+        scope: "line",
         path: "src/long.ts",
         oldLine: 13,
         newLine: 13,
@@ -145,6 +164,10 @@ diff --git a/src/beta.ts b/src/beta.ts
       }),
     ]);
     expect(render(overlay)).toContain("check this guard");
+    const annotatedRender = render(overlay);
+    expect(annotatedRender.indexOf("note: check this guard")).toBeLessThan(
+      annotatedRender.indexOf("context-row-012"),
+    );
 
     overlay.handleInput(TAB);
     overlay.handleInput(ENTER);
@@ -167,13 +190,77 @@ diff --git a/src/beta.ts b/src/beta.ts
     overlay.handleInput("second line");
     expect(render(overlay)).toContain("shift+enter newline");
     overlay.handleInput(ENTER);
-
     expect(overlay.getAnnotations()).toEqual([
-      expect.objectContaining({ newLine: 1, note: "first line\nsecond line" }),
+      expect.objectContaining({
+        scope: "line",
+        newLine: 1,
+        note: "first line\nsecond line",
+      }),
     ]);
     const out = render(overlay);
     expect(out).toContain("first line");
     expect(out).toContain("second line");
+  });
+
+  it("edits notes in place, offers a chooser, and preserves notes on cancel", () => {
+    const overlay = makeOverlay(oneLineDiff);
+
+    render(overlay);
+    overlay.handleInput(TAB);
+    overlay.handleInput("a");
+    overlay.handleInput("first");
+    overlay.handleInput(ENTER);
+    overlay.handleInput("a");
+    overlay.handleInput("second");
+    overlay.handleInput(ENTER);
+    expect(
+      overlay.getAnnotations().map((annotation) => annotation.note),
+    ).toEqual(["first", "second"]);
+    overlay.handleInput("e");
+    expect(render(overlay)).toContain("Edit annotation");
+    expect(render(overlay)).toContain("src/value.ts · -/1 · second");
+    overlay.handleInput(DOWN);
+    overlay.handleInput(ENTER);
+    expect(render(overlay)).toContain("second");
+    overlay.handleInput(ESC);
+    expect(
+      overlay.getAnnotations().map((annotation) => annotation.note),
+    ).toEqual(["first", "second"]);
+
+    overlay.handleInput("e");
+    overlay.handleInput(ENTER);
+    overlay.handleInput("\x15");
+    overlay.handleInput("updated");
+    overlay.handleInput(ENTER);
+    expect(
+      overlay.getAnnotations().map((annotation) => annotation.note),
+    ).toEqual(["updated", "second"]);
+  });
+
+  it("keeps file notes reachable from a narrow diff chooser", () => {
+    const overlay = makeOverlay(oneLineDiff);
+
+    render(overlay, 45);
+    overlay.handleInput("A");
+    overlay.handleInput("file note");
+    overlay.handleInput(ENTER);
+    overlay.handleInput("a");
+    overlay.handleInput("line note");
+    overlay.handleInput(ENTER);
+
+    overlay.handleInput("e");
+    const chooser = render(overlay, 45);
+    expect(chooser).toContain("Edit annotation");
+    expect(chooser).toContain("src/value.ts · -/1 · line note");
+    expect(chooser).toContain("src/value.ts · file · file note");
+
+    overlay.handleInput(DOWN);
+    overlay.handleInput(ENTER);
+    expect(render(overlay, 45)).toContain("Edit annotation");
+    overlay.handleInput(ESC);
+    expect(
+      overlay.getAnnotations().map((annotation) => annotation.note),
+    ).toEqual(["file note", "line note"]);
   });
 
   it("caches static diff rendering through navigation, annotations, and width changes", () => {
@@ -277,7 +364,7 @@ diff --git a/src/beta.ts b/src/beta.ts
     expect(undo.getAnnotations()).toEqual([]);
   });
 
-  it("uses a configured external editor and cleans up its temporary file", async () => {
+  it("uses explicit Ctrl+G for the external editor and returns its draft", async () => {
     const temporaryDirectory = await fs.mkdtemp(
       path.join(os.tmpdir(), "omp-code-review-editor-"),
     );
@@ -313,11 +400,18 @@ diff --git a/src/beta.ts b/src/beta.ts
       overlay.handleInput(TAB);
       overlay.handleInput("a");
       overlay.handleInput("draft");
-      overlay.handleInput("\x05");
+      overlay.handleInput("\x07");
       await editorApplied.promise;
 
+      expect(overlay.getAnnotations()).toEqual([]);
+      expect(render(overlay)).toContain("edited annotation");
+      overlay.handleInput(ENTER);
       expect(overlay.getAnnotations()).toEqual([
-        expect.objectContaining({ newLine: 1, note: "edited annotation" }),
+        expect.objectContaining({
+          scope: "line",
+          newLine: 1,
+          note: "edited annotation",
+        }),
       ]);
       expect(stop).toHaveBeenCalledTimes(1);
       expect(start).toHaveBeenCalledTimes(1);
@@ -352,7 +446,7 @@ diff --git a/src/beta.ts b/src/beta.ts
     expect(out).toContain("after");
   });
 
-  it("does not annotate binary or rename-only files", () => {
+  it("keeps line annotations off binary and rename-only files while allowing file notes", () => {
     const warnings: string[] = [];
     const overlay = makeOverlay(
       `diff --git a/assets/blob.bin b/assets/blob.bin
@@ -371,15 +465,49 @@ rename to src/new-name.ts`,
     expect(render(overlay)).toContain(
       "Binary diff; no annotatable source rows",
     );
+    overlay.handleInput("a");
+    overlay.handleInput("binary note");
+    overlay.handleInput(ENTER);
+    const binaryRender = render(overlay);
+    expect(binaryRender).toContain("file note: binary note");
+    expect(binaryRender.indexOf("file note: binary note")).toBeLessThan(
+      binaryRender.indexOf("Binary diff; no annotatable source rows"),
+    );
+
     overlay.handleInput(TAB);
     overlay.handleInput("a");
     overlay.handleInput("]");
     expect(render(overlay)).toContain(
       "No diff hunks; this may be a rename-only change",
     );
+    overlay.handleInput("A");
+    overlay.handleInput("rename note");
+    overlay.handleInput(ENTER);
+    const renameRender = render(overlay);
+    expect(renameRender).toContain("file note: rename note");
+    expect(renameRender.indexOf("file note: rename note")).toBeLessThan(
+      renameRender.indexOf("No diff hunks; this may be a rename-only change"),
+    );
     overlay.handleInput("a");
 
-    expect(overlay.getAnnotations()).toEqual([]);
+    expect(overlay.getAnnotations()).toEqual([
+      {
+        scope: "file",
+        path: "assets/blob.bin",
+        oldPath: "assets/blob.bin",
+        newPath: "assets/blob.bin",
+        occurrence: 1,
+        note: "binary note",
+      },
+      {
+        scope: "file",
+        path: "src/new-name.ts",
+        oldPath: "src/old-name.ts",
+        newPath: "src/new-name.ts",
+        occurrence: 1,
+        note: "rename note",
+      },
+    ]);
     expect(warnings).toEqual([
       "This file has no annotatable diff rows",
       "This file has no annotatable diff rows",

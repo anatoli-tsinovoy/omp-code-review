@@ -37,6 +37,7 @@ export async function showCodeReviewOverlay(
         target.snapshot.files,
         target.mode,
         {
+          cwd: ctx.cwd,
           onComplete: complete,
           onWarning: (message) => ctx.ui.notify(message, "warning"),
         },

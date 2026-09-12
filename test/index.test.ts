@@ -5,6 +5,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent";
 
 import { runCodeReviewCommand } from "../src/index";
+import { formatCodeReviewAnnotations } from "../src/prompt";
 import { createResolvedReviewTarget } from "../src/review-target";
 import type { CodeReviewDependencies } from "../src/index";
 import type {
@@ -28,12 +29,20 @@ const reviewDiff = `diff --git a/src/auth.ts b/src/auth.ts
 `;
 
 const annotation: CodeReviewAnnotation = {
+  scope: "line",
   path: "src/auth.ts",
   occurrence: 1,
   hunkHeader: "@@ -2 +2 @@",
   newLine: 2,
   rawLine: "+after",
   note: "Handle the invalid credential path before continuing.",
+};
+
+const fileAnnotation: CodeReviewAnnotation = {
+  scope: "file",
+  path: "src/auth.ts",
+  occurrence: 1,
+  note: "Review the authentication boundary and its error handling as a whole.",
 };
 
 function createInteractiveContext(): {
@@ -118,6 +127,17 @@ describe("runCodeReviewCommand", () => {
     expect(selected).toBe(false);
     expect(sent).toHaveLength(1);
     expect(sent[0]).toContain("inspect auth boundaries");
+  });
+
+  test("renders file-level annotations without fabricated line context", () => {
+    const formatted = formatCodeReviewAnnotations([fileAnnotation], {
+      forReviewer: false,
+    });
+
+    expect(formatted).toContain("### src/auth.ts — file");
+    expect(formatted).toContain(fileAnnotation.note);
+    expect(formatted).not.toContain("Hunk:");
+    expect(formatted).not.toContain("```");
   });
 
   test("sends one review request containing annotations and trimmed focus for the frozen target", async () => {

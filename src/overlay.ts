@@ -12,6 +12,7 @@ import {
 import { type KeybindingsManager, type Theme } from "@oh-my-pi/pi-coding-agent";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { getEditorCommand, openInEditor } from "./external-editor";
+import { openFileInTmux } from "./tmux";
 import {
   bottomBorder,
   divider,
@@ -37,6 +38,15 @@ export const PASTE_CODE_REVIEW_ACTION = "Paste annotations into prompt";
 export interface CodeReviewOverlayCallbacks {
   onComplete(result: CodeReviewOverlayResult | undefined): void;
   onWarning?(message: string): void;
+  cwd?: string;
+}
+
+type AnnotationScope = CodeReviewAnnotation["scope"];
+type DiffColor = "toolDiffAdded" | "toolDiffRemoved" | "toolDiffContext";
+
+interface AnnotationChooser {
+  entries: number[];
+  selected: number;
 }
 
 interface CommittedAnnotation {
@@ -44,13 +54,20 @@ interface CommittedAnnotation {
   sourceIndex: number;
   annotation: CodeReviewAnnotation;
 }
-
 interface RenderedDiffBody {
+  lines: string[];
+  renderedRowBySource: number[];
+  selectedSourceLines: string[];
+}
+
+interface RenderedBody {
   lines: string[];
   renderedRowBySource: number[];
 }
 
 type FocusRegion = "files" | "diff" | "actions";
+
+const SOURCE_SELECTION_GUTTER_WIDTH = 2;
 
 const OVERLAY_TITLE = "Code Review";
 const MIN_BODY_ROWS = 3;
@@ -90,6 +107,10 @@ export class CodeReviewOverlay implements Component {
   #bodyHeight = MIN_BODY_ROWS;
   #sidebarShown = false;
   #annotating = false;
+  #annotationScope: AnnotationScope = "line";
+  #editingAnnotationIndex: number | undefined;
+  #annotationChooser: AnnotationChooser | undefined;
+  #externalOperation = false;
   #finished = false;
   #annotations: CommittedAnnotation[] = [];
   #staticRenderedDiffBodies = new WeakMap<ReviewDiffFile, RenderedDiffBody>();
@@ -146,6 +167,10 @@ export class CodeReviewOverlay implements Component {
     this.#editor.setBorderVisible(false);
     this.#editor.setPromptGutter("> ");
     this.#editor.setUseTerminalCursor(false);
+    // Keep the editor's CURSOR_MARKER for correct terminal placement, but
+    // replace its visible end-of-input caret with a stable blank cell.
+    this.#editor.cursorOverride = " ";
+    this.#editor.cursorOverrideWidth = 1;
     this.#editor.setScrollbarVisible(true);
     this.#editor.onSubmit = (value) => this.#commitAnnotation(value);
     this.#externalEditorLabel = keybindings.getDisplayString(
@@ -167,9 +192,16 @@ export class CodeReviewOverlay implements Component {
   }
 
   handleInput(data: string): void {
-    if (this.#finished) return;
+    if (this.#finished || this.#externalOperation) return;
+    if (this.#annotationChooser) {
+      this.#handleAnnotationChooser(data);
+      return;
+    }
     if (this.#annotating) {
-      if (this.keybindings.matches(data, "app.editor.external")) {
+      if (
+        matchesKey(data, "ctrl+g") ||
+        this.keybindings.matches(data, "app.editor.external")
+      ) {
         void this.#openAnnotationEditor();
         return;
       }
@@ -180,8 +212,16 @@ export class CodeReviewOverlay implements Component {
       this.#editor.handleInput(data);
       return;
     }
+    if (matchesKey(data, "ctrl+o")) {
+      void this.#openCurrentFileInTmux();
+      return;
+    }
     if (this.keybindings.matches(data, "tui.select.cancel")) {
       this.#finish(undefined);
+      return;
+    }
+    if (data === "A" && (this.#focus === "files" || this.#focus === "diff")) {
+      this.#startAnnotation("file");
       return;
     }
     if (data === "[") {
@@ -194,6 +234,10 @@ export class CodeReviewOverlay implements Component {
     }
     if (data === "u") {
       this.#undoAnnotation();
+      return;
+    }
+    if (data === "e") {
+      this.#editCurrentAnnotation();
       return;
     }
     if (matchesKey(data, "tab") || data === "\t") {
@@ -226,6 +270,10 @@ export class CodeReviewOverlay implements Component {
   }
 
   #handleFiles(data: string): void {
+    if (data === "a") {
+      this.#startAnnotation("file");
+      return;
+    }
     if (
       this.keybindings.matches(data, "tui.select.up") ||
       matchesKey(data, "k")
@@ -251,7 +299,7 @@ export class CodeReviewOverlay implements Component {
 
   #handleDiff(data: string): void {
     if (data === "a") {
-      this.#startAnnotation();
+      this.#startAnnotation("line");
       return;
     }
     if (matchesKey(data, "left") || matchesKey(data, "h")) {
@@ -361,20 +409,33 @@ export class CodeReviewOverlay implements Component {
     );
   }
 
-  #startAnnotation(): void {
-    if (
-      this.#currentFile()?.isBinary ||
-      this.#currentSourceRows()[this.#sourceIndex] === undefined
-    ) {
+  #startAnnotation(scope: AnnotationScope, existingIndex?: number): void {
+    const file = this.#currentFile();
+    const source = this.#currentSourceRows()[this.#sourceIndex];
+    if (!file || (scope === "line" && (file.isBinary || !source))) {
       this.callbacks.onWarning?.("This file has no annotatable diff rows");
       return;
     }
+    const existing =
+      existingIndex === undefined
+        ? undefined
+        : this.#annotations[existingIndex];
+    if (
+      existing &&
+      (existing.fileIndex !== this.#fileIndex ||
+        existing.annotation.scope !== scope)
+    ) {
+      return;
+    }
+    this.#annotationScope = scope;
+    this.#editingAnnotationIndex = existingIndex;
     this.#annotating = true;
-    this.#editor.setText("");
+    this.#editor.setText(existing?.annotation.note ?? "");
   }
 
   #cancelAnnotation(): void {
     this.#annotating = false;
+    this.#editingAnnotationIndex = undefined;
     this.#editor.setText("");
   }
 
@@ -382,24 +443,124 @@ export class CodeReviewOverlay implements Component {
     const note = value.trim();
     const file = this.#currentFile();
     const source = this.#currentSourceRows()[this.#sourceIndex];
+    const editingIndex = this.#editingAnnotationIndex;
+    const scope = this.#annotationScope;
     this.#annotating = false;
+    this.#editingAnnotationIndex = undefined;
     this.#editor.setText("");
-    if (!note || !file || !source) return;
+
+    // Empty submissions never erase an existing note. The user can cancel
+    // explicitly, and a blank new draft should not create a no-op annotation.
+    if (!note) return;
+    if (editingIndex !== undefined) {
+      const existing = this.#annotations[editingIndex];
+      if (existing) {
+        this.#annotations[editingIndex] = {
+          ...existing,
+          annotation: { ...existing.annotation, note },
+        };
+      }
+      return;
+    }
+    if (!file || (scope === "line" && !source)) return;
+
+    const common = {
+      path: file.path,
+      ...(file.oldPath === undefined ? {} : { oldPath: file.oldPath }),
+      ...(file.newPath === undefined ? {} : { newPath: file.newPath }),
+      occurrence: file.occurrence,
+      note,
+    };
+    const annotation: CodeReviewAnnotation =
+      scope === "file"
+        ? { ...common, scope: "file" }
+        : {
+            ...common,
+            scope: "line",
+            hunkHeader: source!.hunkHeader,
+            ...(source!.oldLine === undefined
+              ? {}
+              : { oldLine: source!.oldLine }),
+            ...(source!.newLine === undefined
+              ? {}
+              : { newLine: source!.newLine }),
+            rawLine: source!.raw,
+          };
     this.#annotations.push({
       fileIndex: this.#fileIndex,
-      sourceIndex: this.#sourceIndex,
-      annotation: {
-        path: file.path,
-        oldPath: file.oldPath,
-        newPath: file.newPath,
-        occurrence: file.occurrence,
-        hunkHeader: source.hunkHeader,
-        oldLine: source.oldLine,
-        newLine: source.newLine,
-        rawLine: source.raw,
-        note,
-      },
+      sourceIndex: scope === "line" ? this.#sourceIndex : -1,
+      annotation,
     });
+  }
+
+  #annotationCandidates(): number[] {
+    if (this.#focus !== "files" && this.#focus !== "diff") return [];
+    const lineEntries: number[] = [];
+    const fileEntries: number[] = [];
+    for (const [index, entry] of this.#annotations.entries()) {
+      if (entry.fileIndex !== this.#fileIndex) continue;
+      if (entry.annotation.scope === "file") {
+        fileEntries.push(index);
+      } else if (
+        this.#focus === "diff" &&
+        entry.sourceIndex === this.#sourceIndex
+      ) {
+        lineEntries.push(index);
+      }
+    }
+    return this.#focus === "files"
+      ? fileEntries
+      : [...lineEntries, ...fileEntries];
+  }
+
+  #editCurrentAnnotation(): void {
+    const entries = this.#annotationCandidates();
+    if (entries.length === 0) return;
+    if (entries.length === 1) {
+      const index = entries[0]!;
+      this.#startAnnotation(this.#annotations[index]!.annotation.scope, index);
+      return;
+    }
+    this.#annotationChooser = { entries, selected: 0 };
+  }
+
+  #handleAnnotationChooser(data: string): void {
+    const chooser = this.#annotationChooser;
+    if (!chooser) return;
+    if (this.keybindings.matches(data, "tui.select.cancel")) {
+      this.#annotationChooser = undefined;
+      return;
+    }
+    if (
+      this.keybindings.matches(data, "tui.select.up") ||
+      matchesKey(data, "up") ||
+      matchesKey(data, "k")
+    ) {
+      chooser.selected =
+        (chooser.selected - 1 + chooser.entries.length) %
+        chooser.entries.length;
+      return;
+    }
+    if (
+      this.keybindings.matches(data, "tui.select.down") ||
+      matchesKey(data, "down") ||
+      matchesKey(data, "j")
+    ) {
+      chooser.selected = (chooser.selected + 1) % chooser.entries.length;
+      return;
+    }
+    if (!this.keybindings.matches(data, "tui.select.confirm")) return;
+    const index = chooser.entries[chooser.selected];
+    this.#annotationChooser = undefined;
+    if (index === undefined) return;
+    const entry = this.#annotations[index];
+    if (entry) this.#startAnnotation(entry.annotation.scope, index);
+  }
+
+  #annotationLocation(entry: CommittedAnnotation): string {
+    if (entry.annotation.scope === "file")
+      return `${displayFileLabel(this.files[entry.fileIndex]!)} · file`;
+    return `${displayFileLabel(this.files[entry.fileIndex]!)} · ${entry.annotation.oldLine ?? "-"}/${entry.annotation.newLine ?? "-"}`;
   }
 
   #undoAnnotation(): void {
@@ -409,6 +570,7 @@ export class CodeReviewOverlay implements Component {
   }
 
   async #openAnnotationEditor(): Promise<void> {
+    if (this.#externalOperation || !this.#annotating) return;
     const editorCommand = getEditorCommand();
     if (!editorCommand) {
       this.callbacks.onWarning?.(
@@ -417,18 +579,44 @@ export class CodeReviewOverlay implements Component {
       return;
     }
     const draft = this.#editor.getExpandedText();
+    this.#externalOperation = true;
+    let stopped = false;
     try {
       this.tui.stop();
+      stopped = true;
       const result = await openInEditor(editorCommand, draft, {
         extension: ".md",
       });
-      if (result !== null) this.#commitAnnotation(result);
+      if (result !== null) this.#editor.setText(result);
     } catch (error) {
       this.callbacks.onWarning?.(
         `Failed to open external editor: ${error instanceof Error ? error.message : String(error)}`,
       );
     } finally {
-      this.tui.start();
+      try {
+        if (stopped) this.tui.start();
+      } finally {
+        this.#externalOperation = false;
+        this.tui.requestRender(true);
+      }
+    }
+  }
+  async #openCurrentFileInTmux(): Promise<void> {
+    if (this.#externalOperation) return;
+    const file = this.#currentFile();
+    if (!file) return;
+    this.#externalOperation = true;
+    try {
+      await openFileInTmux(
+        file.newPath ?? file.path,
+        this.callbacks.cwd ?? process.cwd(),
+      );
+    } catch (error) {
+      this.callbacks.onWarning?.(
+        `Failed to open file in tmux: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      this.#externalOperation = false;
       this.tui.requestRender(true);
     }
   }
@@ -440,7 +628,7 @@ export class CodeReviewOverlay implements Component {
     return count;
   }
 
-  #renderBody(contentWidth: number): RenderedDiffBody {
+  #renderBody(contentWidth: number): RenderedBody {
     const file = this.#currentFile();
     if (!file)
       return {
@@ -450,6 +638,23 @@ export class CodeReviewOverlay implements Component {
     const staticBody = this.#getStaticRenderedBody(file);
     const lines: string[] = [];
     const renderedRowBySource: number[] = [];
+
+    // File notes describe the whole change, so keep them above headers and
+    // status rows (including binary and rename-only files).
+    for (const entry of this.#annotations) {
+      if (
+        entry.fileIndex === this.#fileIndex &&
+        entry.annotation.scope === "file"
+      ) {
+        this.#appendAnnotationCallout(
+          lines,
+          entry.annotation.note,
+          contentWidth,
+          "file note",
+        );
+      }
+    }
+
     let sourceIndex = 0;
     for (let staticRow = 0; staticRow < staticBody.lines.length; staticRow++) {
       const currentSourceIndex =
@@ -457,32 +662,37 @@ export class CodeReviewOverlay implements Component {
           ? sourceIndex++
           : undefined;
       let renderedLine = staticBody.lines[staticRow] ?? "";
-      if (currentSourceIndex !== undefined)
+      if (currentSourceIndex !== undefined) {
+        // Line notes belong immediately before their source row. This keeps
+        // the selected row and all notes in a stable, readable order.
+        for (const entry of this.#annotations) {
+          if (
+            entry.fileIndex === this.#fileIndex &&
+            entry.sourceIndex === currentSourceIndex &&
+            entry.annotation.scope === "line"
+          ) {
+            this.#appendAnnotationCallout(
+              lines,
+              entry.annotation.note,
+              contentWidth,
+            );
+          }
+        }
         renderedRowBySource[currentSourceIndex] = lines.length;
-      if (
-        currentSourceIndex !== undefined &&
-        this.#focus === "diff" &&
-        currentSourceIndex === this.#sourceIndex
-      ) {
-        renderedLine = this.theme.bg(
-          "selectedBg",
-          fit(`${this.theme.nav.cursor} ${renderedLine}`, contentWidth),
-        );
-      }
-      lines.push(truncateToWidth(renderedLine, contentWidth));
-      if (currentSourceIndex === undefined) continue;
-      for (const entry of this.#annotations) {
         if (
-          entry.fileIndex === this.#fileIndex &&
-          entry.sourceIndex === currentSourceIndex
+          this.#focus === "diff" &&
+          currentSourceIndex === this.#sourceIndex
         ) {
-          this.#appendAnnotationCallout(
-            lines,
-            entry.annotation.note,
-            contentWidth,
+          renderedLine = this.theme.bg(
+            "selectedBg",
+            fit(
+              staticBody.selectedSourceLines[currentSourceIndex] ?? "",
+              contentWidth,
+            ),
           );
         }
       }
+      lines.push(truncateToWidth(renderedLine, contentWidth));
     }
     return { lines, renderedRowBySource };
   }
@@ -492,6 +702,7 @@ export class CodeReviewOverlay implements Component {
     if (cached) return cached;
     const lines: string[] = [];
     const renderedRowBySource: number[] = [];
+    const selectedSourceLines: string[] = [];
     if (file.isBinary) {
       lines.push(
         this.theme.fg("dim", "Binary diff; no annotatable source rows"),
@@ -512,7 +723,7 @@ export class CodeReviewOverlay implements Component {
           );
           continue;
         }
-        renderedRowBySource[sourceIndex++] = lines.length;
+        renderedRowBySource[sourceIndex] = lines.length;
         const marker =
           diffRow.kind === "added"
             ? "+"
@@ -523,27 +734,39 @@ export class CodeReviewOverlay implements Component {
           diffRow.kind === "removed"
             ? diffRow.oldLine
             : (diffRow.newLine ?? diffRow.oldLine);
-        const text = `${marker}${String(lineNumber ?? "").padStart(4)} ${replaceTabs(sanitizeText(diffRow.content))}`;
-        const color =
+        const suffix = `${marker}${String(lineNumber ?? "").padStart(4)} ${replaceTabs(sanitizeText(diffRow.content))}`;
+        const color: DiffColor =
           diffRow.kind === "added"
             ? "toolDiffAdded"
             : diffRow.kind === "removed"
               ? "toolDiffRemoved"
               : "toolDiffContext";
-        lines.push(this.theme.fg(color, text));
+        const coloredSuffix = this.theme.fg(color, suffix);
+        const gutter = " ".repeat(SOURCE_SELECTION_GUTTER_WIDTH);
+        selectedSourceLines[sourceIndex] = `${fit(
+          `${this.theme.nav.cursor} `,
+          SOURCE_SELECTION_GUTTER_WIDTH,
+        )}${coloredSuffix}`;
+        lines.push(`${gutter}${coloredSuffix}`);
+        sourceIndex++;
       }
     }
-    const body = { lines, renderedRowBySource };
+    const body = { lines, renderedRowBySource, selectedSourceLines };
     this.#staticRenderedDiffBodies.set(file, body);
     return body;
   }
 
-  #appendAnnotationCallout(lines: string[], note: string, width: number): void {
+  #appendAnnotationCallout(
+    lines: string[],
+    note: string,
+    width: number,
+    label = "note",
+  ): void {
+    const gutter = this.theme.fg("warning", "▎ ");
+    const labelText = this.theme.fg("dim", `${label}: `);
+    const continuation = `${gutter}${" ".repeat(visibleWidth(labelText))}`;
     for (const [index, noteLine] of note.split(/\r?\n/).entries()) {
-      const prefix =
-        index === 0
-          ? `${this.theme.fg("warning", "▎ ")}${this.theme.fg("dim", "note: ")}`
-          : `${this.theme.fg("warning", "▎ ")}      `;
+      const prefix = index === 0 ? `${gutter}${labelText}` : continuation;
       const available = Math.max(0, width - visibleWidth(prefix));
       const content = truncateToWidth(
         replaceTabs(sanitizeText(noteLine)),
@@ -631,19 +854,61 @@ export class CodeReviewOverlay implements Component {
     });
   }
 
+  #renderAnnotationChooser(width: number): string[] {
+    const chooser = this.#annotationChooser;
+    if (!chooser) return [];
+    const options = chooser.entries.map((index, optionIndex) => {
+      const entry = this.#annotations[index];
+      if (!entry) return "";
+      const marker =
+        optionIndex === chooser.selected ? `${this.theme.nav.cursor} ` : "  ";
+      const location = this.#annotationLocation(entry);
+      const note = sanitizeStatusText(
+        entry.annotation.note.split(/\r?\n/, 1)[0] ?? "",
+      );
+      return fit(`${marker}${location} · ${note}`, width);
+    });
+    return [
+      this.theme.fg(
+        "dim",
+        "Edit annotation · ↑↓ choose · enter edit · esc cancel",
+      ),
+      ...options,
+    ];
+  }
+
   #renderFooter(width: number): string[] {
+    if (this.#annotationChooser) {
+      return this.#renderAnnotationChooser(width);
+    }
     if (this.#annotating) {
+      const file = this.#currentFile();
       const source = this.#currentSourceRows()[this.#sourceIndex];
-      const location = source
-        ? `${displayFileLabel(this.#currentFile()!)} · ${source.oldLine ?? "-"}/${source.newLine ?? "-"}`
-        : "diff row";
+      const location =
+        this.#annotationScope === "file"
+          ? file
+            ? `${displayFileLabel(file)} · file`
+            : "file"
+          : source && file
+            ? `${displayFileLabel(file)} · ${source.oldLine ?? "-"}/${source.newLine ?? "-"}`
+            : "diff row";
+      const action =
+        this.#editingAnnotationIndex === undefined
+          ? this.#annotationScope === "file"
+            ? "Annotate file"
+            : "Annotate line"
+          : "Edit annotation";
       const caption = truncateToWidth(
-        `${this.theme.fg("dim", "Annotate")} ${this.theme.fg("accent", sanitizeStatusText(location))}`,
+        `${this.theme.fg("dim", action)} ${this.theme.fg("accent", sanitizeStatusText(location))}`,
         width,
         Ellipsis.Unicode,
       );
       const hints = ["enter save", "shift+enter newline", "esc cancel"];
-      if (this.#externalEditorLabel)
+      hints.push("ctrl+g editor");
+      if (
+        this.#externalEditorLabel &&
+        this.#externalEditorLabel.toLowerCase() !== "ctrl+g"
+      )
         hints.push(`${this.#externalEditorLabel} editor`);
       this.#editor.focused = true;
       return [
@@ -654,14 +919,14 @@ export class CodeReviewOverlay implements Component {
     }
     const focusHelp =
       this.#focus === "files"
-        ? "↑↓ file · ⏎ diff"
+        ? "↑↓ file · ⏎ diff · a/A file note · e edit note"
         : this.#focus === "diff"
-          ? "↑↓ line · ⇧ faster · pgup/pgdn · g/G ends · a annotate"
+          ? "↑↓ line · ⇧ faster · pgup/pgdn · g/G ends · a line note · A file note · e edit note"
           : "↑↓ select · ⏎ confirm";
     return [
       this.theme.fg(
         "dim",
-        `${focusHelp} · [/] file · u undo · tab regions · esc cancel`,
+        `${focusHelp} · ctrl+o open file · [/] file · u undo · tab regions · esc cancel`,
       ),
     ];
   }

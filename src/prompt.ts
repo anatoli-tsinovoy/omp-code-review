@@ -18,10 +18,11 @@ export interface FormatCodeReviewAnnotationsOptions {
   supplementalInstructions?: string;
 }
 
-interface RenderedAnnotation extends CodeReviewAnnotation {
+type RenderedAnnotation = CodeReviewAnnotation & {
   pathLabel: string;
-  lineLabel: string;
-}
+  lineLabel?: string;
+  isLine: boolean;
+};
 
 interface ReviewPromptFile {
   path: string;
@@ -37,7 +38,9 @@ function formatPathLabel(annotation: CodeReviewAnnotation): string {
     : annotation.path;
 }
 
-function formatLineLabel(annotation: CodeReviewAnnotation): string {
+function formatLineLabel(
+  annotation: Extract<CodeReviewAnnotation, { scope: "line" }>,
+): string {
   if (annotation.oldLine !== undefined && annotation.newLine !== undefined) {
     return `old ${annotation.oldLine}, new ${annotation.newLine}`;
   }
@@ -62,7 +65,7 @@ function renderReviewPromptFile(file: ReviewDiffFile): ReviewPromptFile {
   };
 }
 
-/** Formats exact source annotations for a reviewer prompt or editor paste. */
+/** Formats exact annotations for a reviewer prompt or editor paste. */
 export function formatCodeReviewAnnotations(
   annotations: readonly CodeReviewAnnotation[],
   options: FormatCodeReviewAnnotationsOptions,
@@ -71,11 +74,19 @@ export function formatCodeReviewAnnotations(
   if (annotations.length === 0 && !supplementalInstructions) return undefined;
 
   const renderedAnnotations: RenderedAnnotation[] = annotations.map(
-    (annotation) => ({
-      ...annotation,
-      pathLabel: formatPathLabel(annotation),
-      lineLabel: formatLineLabel(annotation),
-    }),
+    (annotation) =>
+      annotation.scope === "line"
+        ? {
+            ...annotation,
+            pathLabel: formatPathLabel(annotation),
+            lineLabel: formatLineLabel(annotation),
+            isLine: true,
+          }
+        : {
+            ...annotation,
+            pathLabel: formatPathLabel(annotation),
+            isLine: false,
+          },
   );
   return prompt.render(annotationsTemplate, {
     forReviewer: options.forReviewer,

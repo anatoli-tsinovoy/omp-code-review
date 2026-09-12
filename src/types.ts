@@ -51,17 +51,25 @@ export interface ResolvedReviewTarget {
   contextInstruction?: string;
 }
 
-export interface CodeReviewAnnotation {
+export interface CodeReviewAnnotationBase {
   path: string;
   oldPath?: string;
   newPath?: string;
   occurrence: number;
-  hunkHeader: string;
-  oldLine?: number;
-  newLine?: number;
-  rawLine: string;
   note: string;
 }
+
+export type CodeReviewAnnotation =
+  | (CodeReviewAnnotationBase & {
+      scope: "file";
+    })
+  | (CodeReviewAnnotationBase & {
+      scope: "line";
+      hunkHeader: string;
+      oldLine?: number;
+      newLine?: number;
+      rawLine: string;
+    });
 
 export interface CodeReviewOverlayResult {
   action: "review" | "paste";
