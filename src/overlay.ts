@@ -8,6 +8,7 @@ import {
   type TUI,
   truncateToWidth,
   visibleWidth,
+  wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
 import { type KeybindingsManager, type Theme } from "@oh-my-pi/pi-coding-agent";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
@@ -25,6 +26,11 @@ import {
   topBorderSplit,
 } from "./overlay-box";
 import type {
+  TextReviewAnnotation,
+  TextReviewOverlayResult,
+  TextReviewSource,
+} from "./text-types";
+import type {
   CodeReviewAnnotation,
   CodeReviewOverlayResult,
   ReviewDiffFile,
@@ -41,10 +47,20 @@ export interface CodeReviewOverlayCallbacks {
   cwd?: string;
 }
 
-type AnnotationScope = CodeReviewAnnotation["scope"];
+export interface TextReviewOverlayCallbacks {
+  onComplete(result: TextReviewOverlayResult | undefined): void;
+  onWarning?(message: string): void;
+  cwd?: string;
+}
+
+type OverlayCallbacks = CodeReviewOverlayCallbacks | TextReviewOverlayCallbacks;
+
+type AnnotationScope =
+  CodeReviewAnnotation["scope"] | TextReviewAnnotation["scope"];
 type DiffColor = "toolDiffAdded" | "toolDiffRemoved" | "toolDiffContext";
 
 interface AnnotationChooser {
+  kind: "diff" | "text";
   entries: number[];
   selected: number;
 }
@@ -53,6 +69,11 @@ interface CommittedAnnotation {
   fileIndex: number;
   sourceIndex: number;
   annotation: CodeReviewAnnotation;
+}
+
+interface CommittedTextAnnotation {
+  sourceIndex: number;
+  annotation: TextReviewAnnotation;
 }
 interface RenderedDiffBody {
   lines: string[];
@@ -70,6 +91,7 @@ type FocusRegion = "files" | "diff" | "actions";
 const SOURCE_SELECTION_GUTTER_WIDTH = 2;
 
 const OVERLAY_TITLE = "Code Review";
+const TEXT_OVERLAY_TITLE = "Text Review";
 const MIN_BODY_ROWS = 3;
 const SIDEBAR_MIN_TOTAL_WIDTH = 64;
 const SIDEBAR_MIN_BODY_WIDTH = 40;
@@ -88,12 +110,21 @@ function isSourceRow(row: ReviewDiffRow): row is ReviewSourceRow {
 function displayFileLabel(file: ReviewDiffFile): string {
   return file.occurrence > 1 ? `${file.path} (${file.occurrence})` : file.path;
 }
-
 function sanitizeStatusText(text: string): string {
   return sanitizeText(text)
     .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
     .replace(/ +/g, " ")
     .trim();
+}
+
+function splitTextLines(text: string): string[] {
+  return text.split(/\r\n|\n|\r/);
+}
+
+function isTextSource(
+  value: readonly ReviewDiffFile[] | TextReviewSource,
+): value is TextReviewSource {
+  return !Array.isArray(value);
 }
 
 /** A fullscreen, annotated diff picker that only relies on public OMP APIs. */
@@ -113,17 +144,59 @@ export class CodeReviewOverlay implements Component {
   #externalOperation = false;
   #finished = false;
   #annotations: CommittedAnnotation[] = [];
+  #textAnnotations: CommittedTextAnnotation[] = [];
+  #textSource: TextReviewSource | undefined;
+  #textLines: readonly string[] = [];
+  #textViewportDriven = false;
+  #textRenderedRowBySource: readonly number[] = [];
   #staticRenderedDiffBodies = new WeakMap<ReviewDiffFile, RenderedDiffBody>();
   #externalEditorLabel: string;
 
+  private readonly tui: TUI;
+  private readonly theme: Theme;
+  private readonly keybindings: KeybindingsManager;
+  private readonly files: readonly ReviewDiffFile[];
+  private readonly mode: string;
+  private readonly callbacks: OverlayCallbacks;
+
   constructor(
-    private readonly tui: TUI,
-    private readonly theme: Theme,
-    private readonly keybindings: KeybindingsManager,
-    private readonly files: readonly ReviewDiffFile[],
-    private readonly mode: string,
-    private readonly callbacks: CodeReviewOverlayCallbacks,
+    tui: TUI,
+    theme: Theme,
+    keybindings: KeybindingsManager,
+    files: readonly ReviewDiffFile[],
+    mode: string,
+    callbacks: CodeReviewOverlayCallbacks,
+  );
+  constructor(
+    tui: TUI,
+    theme: Theme,
+    keybindings: KeybindingsManager,
+    source: TextReviewSource,
+    callbacks: TextReviewOverlayCallbacks,
+  );
+  constructor(
+    tui: TUI,
+    theme: Theme,
+    keybindings: KeybindingsManager,
+    filesOrSource: readonly ReviewDiffFile[] | TextReviewSource,
+    modeOrCallbacks: string | TextReviewOverlayCallbacks,
+    maybeCallbacks?: CodeReviewOverlayCallbacks,
   ) {
+    this.tui = tui;
+    this.theme = theme;
+    this.keybindings = keybindings;
+    if (isTextSource(filesOrSource)) {
+      this.files = [];
+      this.mode = "Reviewing text";
+      this.callbacks = modeOrCallbacks as TextReviewOverlayCallbacks;
+      this.#textSource = { ...filesOrSource };
+      this.#textLines = splitTextLines(filesOrSource.text);
+      this.#focus = "diff";
+    } else {
+      this.files = filesOrSource;
+      this.mode = modeOrCallbacks as string;
+      this.callbacks = maybeCallbacks!;
+    }
     const symbols = {
       cursor: theme.nav.cursor,
       inputCursor: theme.nav.cursor,
@@ -167,7 +240,7 @@ export class CodeReviewOverlay implements Component {
     this.#editor.setBorderVisible(false);
     this.#editor.setPromptGutter("> ");
     this.#editor.setUseTerminalCursor(false);
-    // Keep the editor's CURSOR_MARKER for correct terminal placement, but
+    // Keep the editor's CURSOR_MARKER for terminal cursor placement, but
     // replace its visible end-of-input caret with a stable blank cell.
     this.#editor.cursorOverride = " ";
     this.#editor.cursorOverrideWidth = 1;
@@ -191,6 +264,10 @@ export class CodeReviewOverlay implements Component {
     return this.#annotations.map((entry) => ({ ...entry.annotation }));
   }
 
+  getTextAnnotations(): TextReviewAnnotation[] {
+    return this.#textAnnotations.map((entry) => ({ ...entry.annotation }));
+  }
+
   handleInput(data: string): void {
     if (this.#finished || this.#externalOperation) return;
     if (this.#annotationChooser) {
@@ -212,7 +289,7 @@ export class CodeReviewOverlay implements Component {
       this.#editor.handleInput(data);
       return;
     }
-    if (matchesKey(data, "ctrl+o")) {
+    if (!this.#textSource && matchesKey(data, "ctrl+o")) {
       void this.#openCurrentFileInTmux();
       return;
     }
@@ -221,14 +298,14 @@ export class CodeReviewOverlay implements Component {
       return;
     }
     if (data === "A" && (this.#focus === "files" || this.#focus === "diff")) {
-      this.#startAnnotation("file");
+      this.#startAnnotation(this.#textSource ? "text" : "file");
       return;
     }
-    if (data === "[") {
+    if (!this.#textSource && data === "[") {
       this.#selectRelativeFile(-1);
       return;
     }
-    if (data === "]") {
+    if (!this.#textSource && data === "]") {
       this.#selectRelativeFile(1);
       return;
     }
@@ -253,10 +330,20 @@ export class CodeReviewOverlay implements Component {
     else this.#handleActions(data);
   }
 
-  #finish(result: CodeReviewOverlayResult | undefined): void {
+  #finish(
+    result: CodeReviewOverlayResult | TextReviewOverlayResult | undefined,
+  ): void {
     if (this.#finished) return;
     this.#finished = true;
-    this.callbacks.onComplete(result);
+    if (this.#textSource) {
+      (this.callbacks as TextReviewOverlayCallbacks).onComplete(
+        result as TextReviewOverlayResult | undefined,
+      );
+    } else {
+      (this.callbacks as CodeReviewOverlayCallbacks).onComplete(
+        result as CodeReviewOverlayResult | undefined,
+      );
+    }
   }
 
   #cycleFocus(direction: number): void {
@@ -337,16 +424,37 @@ export class CodeReviewOverlay implements Component {
       return;
     }
     if (this.keybindings.matches(data, "tui.select.pageUp")) {
-      this.#moveSourceCursor(-Math.max(1, this.#bodyHeight - 1));
+      if (this.#textSource) {
+        this.#scrollView.page(-1);
+        this.#textViewportDriven = true;
+        this.#syncTextCursorToViewport();
+      } else {
+        this.#moveSourceCursor(-Math.max(1, this.#bodyHeight - 1));
+      }
       return;
     }
     if (this.keybindings.matches(data, "tui.select.pageDown")) {
-      this.#moveSourceCursor(Math.max(1, this.#bodyHeight - 1));
+      if (this.#textSource) {
+        this.#scrollView.page(1);
+        this.#textViewportDriven = true;
+        this.#syncTextCursorToViewport();
+      } else {
+        this.#moveSourceCursor(Math.max(1, this.#bodyHeight - 1));
+      }
       return;
     }
-    if (data === "g" || matchesKey(data, "home")) this.#sourceIndex = 0;
-    else if (data === "G" || matchesKey(data, "end"))
-      this.#sourceIndex = Math.max(0, this.#currentSourceRows().length - 1);
+    if (data === "g" || matchesKey(data, "home")) {
+      this.#sourceIndex = 0;
+      this.#textViewportDriven = false;
+    } else if (data === "G" || matchesKey(data, "end")) {
+      this.#sourceIndex = Math.max(
+        0,
+        (this.#textSource
+          ? this.#textLines.length
+          : this.#currentSourceRows().length) - 1,
+      );
+      this.#textViewportDriven = false;
+    }
   }
 
   #handleActions(data: string): void {
@@ -357,19 +465,29 @@ export class CodeReviewOverlay implements Component {
       this.#actionIndex = 0;
       return;
     }
+    const hasAnnotations = this.#textSource
+      ? this.#textAnnotations.length > 0
+      : this.#annotations.length > 0;
     if (
       this.keybindings.matches(data, "tui.select.down") ||
       matchesKey(data, "j")
     ) {
-      if (this.#annotations.length > 0) this.#actionIndex = 1;
+      if (hasAnnotations) this.#actionIndex = 1;
       return;
     }
     if (this.keybindings.matches(data, "tui.select.confirm")) {
-      if (this.#actionIndex === 1 && this.#annotations.length === 0) return;
-      this.#finish({
-        action: this.#actionIndex === 0 ? "review" : "paste",
-        annotations: this.getAnnotations(),
-      });
+      if (this.#actionIndex === 1 && !hasAnnotations) return;
+      if (this.#textSource) {
+        this.#finish({
+          action: this.#actionIndex === 0 ? "review" : "paste",
+          annotations: this.getTextAnnotations(),
+        });
+      } else {
+        this.#finish({
+          action: this.#actionIndex === 0 ? "review" : "paste",
+          annotations: this.getAnnotations(),
+        });
+      }
     }
   }
 
@@ -399,17 +517,42 @@ export class CodeReviewOverlay implements Component {
     const file = this.#currentFile();
     return file ? file.rows.filter(isSourceRow) : [];
   }
+  #syncTextCursorToViewport(): void {
+    if (!this.#textSource || this.#textRenderedRowBySource.length === 0) return;
+    const viewportTop = this.#scrollView.getScrollOffset();
+    const viewportBottom = viewportTop + Math.max(0, this.#bodyHeight - 1);
+    let topSourceIndex = 0;
+    let lastVisibleSourceIndex = 0;
+    for (let index = 1; index < this.#textRenderedRowBySource.length; index++) {
+      const renderedRow = this.#textRenderedRowBySource[index];
+      if (renderedRow === undefined || renderedRow > viewportBottom) break;
+      lastVisibleSourceIndex = index;
+      if (renderedRow <= viewportTop) topSourceIndex = index;
+    }
+    const atBottom =
+      this.#scrollView.getMaxScrollOffset() > 0 &&
+      viewportTop === this.#scrollView.getMaxScrollOffset();
+    this.#sourceIndex = atBottom ? lastVisibleSourceIndex : topSourceIndex;
+  }
 
   #moveSourceCursor(delta: number): void {
-    const rows = this.#currentSourceRows();
-    if (rows.length === 0) return;
+    const rowCount = this.#textSource
+      ? this.#textLines.length
+      : this.#currentSourceRows().length;
+    if (rowCount === 0) return;
     this.#sourceIndex = Math.max(
       0,
-      Math.min(rows.length - 1, this.#sourceIndex + delta),
+      Math.min(rowCount - 1, this.#sourceIndex + delta),
     );
+    if (this.#textSource) this.#textViewportDriven = false;
   }
 
   #startAnnotation(scope: AnnotationScope, existingIndex?: number): void {
+    if (this.#textSource) {
+      if (scope === "text" || scope === "line")
+        this.#startTextAnnotation(scope, existingIndex);
+      return;
+    }
     const file = this.#currentFile();
     const source = this.#currentSourceRows()[this.#sourceIndex];
     if (!file || (scope === "line" && (file.isBinary || !source))) {
@@ -427,6 +570,21 @@ export class CodeReviewOverlay implements Component {
     ) {
       return;
     }
+    this.#annotationScope = scope === "file" ? "file" : "line";
+    this.#editingAnnotationIndex = existingIndex;
+    this.#annotating = true;
+    this.#editor.setText(existing?.annotation.note ?? "");
+  }
+
+  #startTextAnnotation(
+    scope: TextReviewAnnotation["scope"],
+    existingIndex?: number,
+  ): void {
+    const existing =
+      existingIndex === undefined
+        ? undefined
+        : this.#textAnnotations[existingIndex];
+    if (existing && existing.annotation.scope !== scope) return;
     this.#annotationScope = scope;
     this.#editingAnnotationIndex = existingIndex;
     this.#annotating = true;
@@ -440,11 +598,16 @@ export class CodeReviewOverlay implements Component {
   }
 
   #commitAnnotation(value: string): void {
+    if (this.#textSource) {
+      this.#commitTextAnnotation(value);
+      return;
+    }
     const note = value.trim();
     const file = this.#currentFile();
     const source = this.#currentSourceRows()[this.#sourceIndex];
     const editingIndex = this.#editingAnnotationIndex;
-    const scope = this.#annotationScope;
+    const scope: CodeReviewAnnotation["scope"] =
+      this.#annotationScope === "file" ? "file" : "line";
     this.#annotating = false;
     this.#editingAnnotationIndex = undefined;
     this.#editor.setText("");
@@ -493,8 +656,54 @@ export class CodeReviewOverlay implements Component {
     });
   }
 
+  #commitTextAnnotation(value: string): void {
+    const note = value.trim();
+    const editingIndex = this.#editingAnnotationIndex;
+    const scope: TextReviewAnnotation["scope"] =
+      this.#annotationScope === "text" ? "text" : "line";
+    const sourceLine = this.#textLines[this.#sourceIndex] ?? "";
+    this.#annotating = false;
+    this.#editingAnnotationIndex = undefined;
+    this.#editor.setText("");
+    if (!note) return;
+    if (editingIndex !== undefined) {
+      const existing = this.#textAnnotations[editingIndex];
+      if (existing) {
+        this.#textAnnotations[editingIndex] = {
+          ...existing,
+          annotation: { ...existing.annotation, note },
+        };
+      }
+      return;
+    }
+    const annotation: TextReviewAnnotation =
+      scope === "text"
+        ? { scope: "text", note }
+        : {
+            scope: "line",
+            line: this.#sourceIndex + 1,
+            quote: sourceLine,
+            note,
+          };
+    this.#textAnnotations.push({
+      sourceIndex: scope === "line" ? this.#sourceIndex : -1,
+      annotation,
+    });
+  }
+
   #annotationCandidates(): number[] {
     if (this.#focus !== "files" && this.#focus !== "diff") return [];
+    if (this.#textSource) {
+      if (this.#focus !== "diff") return [];
+      const lineEntries: number[] = [];
+      const textEntries: number[] = [];
+      for (const [index, entry] of this.#textAnnotations.entries()) {
+        if (entry.annotation.scope === "text") textEntries.push(index);
+        else if (entry.sourceIndex === this.#sourceIndex)
+          lineEntries.push(index);
+      }
+      return [...lineEntries, ...textEntries];
+    }
     const lineEntries: number[] = [];
     const fileEntries: number[] = [];
     for (const [index, entry] of this.#annotations.entries()) {
@@ -518,10 +727,24 @@ export class CodeReviewOverlay implements Component {
     if (entries.length === 0) return;
     if (entries.length === 1) {
       const index = entries[0]!;
-      this.#startAnnotation(this.#annotations[index]!.annotation.scope, index);
+      if (this.#textSource) {
+        this.#startTextAnnotation(
+          this.#textAnnotations[index]!.annotation.scope,
+          index,
+        );
+      } else {
+        this.#startAnnotation(
+          this.#annotations[index]!.annotation.scope,
+          index,
+        );
+      }
       return;
     }
-    this.#annotationChooser = { entries, selected: 0 };
+    this.#annotationChooser = {
+      kind: this.#textSource ? "text" : "diff",
+      entries,
+      selected: 0,
+    };
   }
 
   #handleAnnotationChooser(data: string): void {
@@ -553,8 +776,13 @@ export class CodeReviewOverlay implements Component {
     const index = chooser.entries[chooser.selected];
     this.#annotationChooser = undefined;
     if (index === undefined) return;
-    const entry = this.#annotations[index];
-    if (entry) this.#startAnnotation(entry.annotation.scope, index);
+    if (chooser.kind === "text") {
+      const entry = this.#textAnnotations[index];
+      if (entry) this.#startTextAnnotation(entry.annotation.scope, index);
+    } else {
+      const entry = this.#annotations[index];
+      if (entry) this.#startAnnotation(entry.annotation.scope, index);
+    }
   }
 
   #annotationLocation(entry: CommittedAnnotation): string {
@@ -563,7 +791,19 @@ export class CodeReviewOverlay implements Component {
     return `${displayFileLabel(this.files[entry.fileIndex]!)} · ${entry.annotation.oldLine ?? "-"}/${entry.annotation.newLine ?? "-"}`;
   }
 
+  #textAnnotationLocation(entry: CommittedTextAnnotation): string {
+    if (entry.annotation.scope === "text")
+      return `${sanitizeStatusText(this.#textSource?.label ?? "text")} · text`;
+    return `${sanitizeStatusText(this.#textSource?.label ?? "text")} · line ${entry.annotation.line}`;
+  }
+
   #undoAnnotation(): void {
+    if (this.#textSource) {
+      this.#textAnnotations.pop();
+      if (this.#textAnnotations.length === 0 && this.#actionIndex === 1)
+        this.#actionIndex = 0;
+      return;
+    }
     this.#annotations.pop();
     if (this.#annotations.length === 0 && this.#actionIndex === 1)
       this.#actionIndex = 0;
@@ -602,7 +842,7 @@ export class CodeReviewOverlay implements Component {
     }
   }
   async #openCurrentFileInTmux(): Promise<void> {
-    if (this.#externalOperation) return;
+    if (this.#textSource || this.#externalOperation) return;
     const file = this.#currentFile();
     if (!file) return;
     this.#externalOperation = true;
@@ -629,6 +869,7 @@ export class CodeReviewOverlay implements Component {
   }
 
   #renderBody(contentWidth: number): RenderedBody {
+    if (this.#textSource) return this.#renderTextBody(contentWidth);
     const file = this.#currentFile();
     if (!file)
       return {
@@ -693,6 +934,55 @@ export class CodeReviewOverlay implements Component {
         }
       }
       lines.push(truncateToWidth(renderedLine, contentWidth));
+    }
+    return { lines, renderedRowBySource };
+  }
+
+  #renderTextBody(contentWidth: number): RenderedBody {
+    const lines: string[] = [];
+    const renderedRowBySource: number[] = [];
+    const textWidth = Math.max(1, contentWidth - SOURCE_SELECTION_GUTTER_WIDTH);
+
+    for (const entry of this.#textAnnotations) {
+      if (entry.annotation.scope === "text") {
+        this.#appendAnnotationCallout(
+          lines,
+          entry.annotation.note,
+          contentWidth,
+          "text note",
+        );
+      }
+    }
+
+    for (const [sourceIndex, sourceLine] of this.#textLines.entries()) {
+      for (const entry of this.#textAnnotations) {
+        if (
+          entry.annotation.scope === "line" &&
+          entry.sourceIndex === sourceIndex
+        ) {
+          this.#appendAnnotationCallout(
+            lines,
+            entry.annotation.note,
+            contentWidth,
+          );
+        }
+      }
+      renderedRowBySource[sourceIndex] = lines.length;
+      const displayLine = replaceTabs(sanitizeText(sourceLine));
+      const wrapped = wrapTextWithAnsi(displayLine, textWidth);
+      const visualRows = wrapped.length > 0 ? wrapped : [""];
+      for (const [rowIndex, visualRow] of visualRows.entries()) {
+        const selected =
+          this.#focus === "diff" && sourceIndex === this.#sourceIndex;
+        const gutter =
+          selected && rowIndex === 0
+            ? fit(`${this.theme.nav.cursor} `, SOURCE_SELECTION_GUTTER_WIDTH)
+            : " ".repeat(SOURCE_SELECTION_GUTTER_WIDTH);
+        const renderedLine = fit(`${gutter}${visualRow}`, contentWidth);
+        lines.push(
+          selected ? this.theme.bg("selectedBg", renderedLine) : renderedLine,
+        );
+      }
     }
     return { lines, renderedRowBySource };
   }
@@ -779,7 +1069,150 @@ export class CodeReviewOverlay implements Component {
     }
   }
 
+  #renderCurrentFileHeader(width: number): string {
+    if (this.#textSource) {
+      const count = this.#textAnnotations.length;
+      const suffix = count ? this.theme.fg("dim", `  ✎${count}`) : "";
+      return truncateToWidth(
+        `${this.theme.bold(sanitizeStatusText(this.#textSource.label))}${suffix}`,
+        width,
+        Ellipsis.Unicode,
+      );
+    }
+    const file = this.#currentFile();
+    if (!file) return this.theme.fg("dim", "No reviewable files");
+    const count = this.#annotationCount(this.#fileIndex);
+    const suffix = `  +${file.linesAdded}/-${file.linesRemoved}${count ? `  ✎${count}` : ""}`;
+    return truncateToWidth(
+      `${this.theme.bold(sanitizeStatusText(displayFileLabel(file)))}${this.theme.fg("dim", suffix)}`,
+      width,
+      Ellipsis.Unicode,
+    );
+  }
+
+  #renderActions(): string[] {
+    const hasAnnotations = this.#textSource
+      ? this.#textAnnotations.length > 0
+      : this.#annotations.length > 0;
+    return ACTIONS.map((label, index) => {
+      const disabled = index === 1 && !hasAnnotations;
+      const selected = index === this.#actionIndex;
+      const cursor = selected ? `${this.theme.nav.cursor} ` : "  ";
+      const text = disabled
+        ? this.theme.fg("dim", label)
+        : selected && this.#focus === "actions"
+          ? this.theme.bold(this.theme.fg("accent", label))
+          : this.theme.fg("text", label);
+      return cursor + text;
+    });
+  }
+
+  #renderAnnotationChooser(width: number): string[] {
+    const chooser = this.#annotationChooser;
+    if (!chooser) return [];
+    const options = chooser.entries.map((index, optionIndex) => {
+      const marker =
+        optionIndex === chooser.selected ? `${this.theme.nav.cursor} ` : "  ";
+      if (chooser.kind === "text") {
+        const entry = this.#textAnnotations[index];
+        if (!entry) return "";
+        const location = this.#textAnnotationLocation(entry);
+        const note = sanitizeStatusText(
+          entry.annotation.note.split(/\r?\n/, 1)[0] ?? "",
+        );
+        return fit(`${marker}${location} · ${note}`, width);
+      }
+      const entry = this.#annotations[index];
+      if (!entry) return "";
+      const location = this.#annotationLocation(entry);
+      const note = sanitizeStatusText(
+        entry.annotation.note.split(/\r?\n/, 1)[0] ?? "",
+      );
+      return fit(`${marker}${location} · ${note}`, width);
+    });
+    return [
+      this.theme.fg(
+        "dim",
+        "Edit annotation · ↑↓ choose · enter edit · esc cancel",
+      ),
+      ...options,
+    ];
+  }
+
+  #renderFooter(width: number): string[] {
+    if (this.#annotationChooser) {
+      return this.#renderAnnotationChooser(width);
+    }
+    if (this.#annotating) {
+      let location: string;
+      let action: string;
+      if (this.#textSource) {
+        const label = sanitizeStatusText(this.#textSource.label);
+        location =
+          this.#annotationScope === "text"
+            ? `${label} · text`
+            : `${label} · line ${this.#sourceIndex + 1}`;
+        action =
+          this.#editingAnnotationIndex === undefined
+            ? this.#annotationScope === "text"
+              ? "Annotate text"
+              : "Annotate line"
+            : "Edit annotation";
+      } else {
+        const file = this.#currentFile();
+        const source = this.#currentSourceRows()[this.#sourceIndex];
+        location =
+          this.#annotationScope === "file"
+            ? file
+              ? `${displayFileLabel(file)} · file`
+              : "file"
+            : source && file
+              ? `${displayFileLabel(file)} · ${source.oldLine ?? "-"}/${source.newLine ?? "-"}`
+              : "diff row";
+        action =
+          this.#editingAnnotationIndex === undefined
+            ? this.#annotationScope === "file"
+              ? "Annotate file"
+              : "Annotate line"
+            : "Edit annotation";
+      }
+      const caption = truncateToWidth(
+        `${this.theme.fg("dim", action)} ${this.theme.fg("accent", sanitizeStatusText(location))}`,
+        width,
+        Ellipsis.Unicode,
+      );
+      const hints = ["enter save", "shift+enter newline", "esc cancel"];
+      hints.push("ctrl+g editor");
+      if (
+        this.#externalEditorLabel &&
+        this.#externalEditorLabel.toLowerCase() !== "ctrl+g"
+      )
+        hints.push(`${this.#externalEditorLabel} editor`);
+      this.#editor.focused = true;
+      return [
+        caption,
+        ...this.#editor.render(width),
+        this.theme.fg("dim", hints.join(" · ")),
+      ];
+    }
+    const focusHelp =
+      this.#focus === "files"
+        ? "↑↓ file · ⏎ diff · a/A file note · e edit note"
+        : this.#focus === "diff"
+          ? this.#textSource
+            ? "↑↓ line · ⇧ faster · pgup/pgdn · g/G ends · a line note · A text note · e edit note"
+            : "↑↓ line · ⇧ faster · pgup/pgdn · g/G ends · a line note · A file note · e edit note"
+          : "↑↓ select · ⏎ confirm";
+    const fileHelp = this.#textSource ? "" : " · ctrl+o open file · [/] file";
+    return [
+      this.theme.fg(
+        "dim",
+        `${focusHelp}${fileHelp} · u undo · tab regions · esc cancel`,
+      ),
+    ];
+  }
   #ensureCursorVisible(renderedRowBySource: readonly number[]): void {
+    if (this.#textSource && this.#textViewportDriven) return;
     const rowIndex = renderedRowBySource[this.#sourceIndex];
     if (rowIndex === undefined) return;
     const offset = this.#scrollView.getScrollOffset();
@@ -828,112 +1261,9 @@ export class CodeReviewOverlay implements Component {
     });
   }
 
-  #renderCurrentFileHeader(width: number): string {
-    const file = this.#currentFile();
-    if (!file) return this.theme.fg("dim", "No reviewable files");
-    const count = this.#annotationCount(this.#fileIndex);
-    const suffix = `  +${file.linesAdded}/-${file.linesRemoved}${count ? `  ✎${count}` : ""}`;
-    return truncateToWidth(
-      `${this.theme.bold(sanitizeStatusText(displayFileLabel(file)))}${this.theme.fg("dim", suffix)}`,
-      width,
-      Ellipsis.Unicode,
-    );
-  }
-
-  #renderActions(): string[] {
-    return ACTIONS.map((label, index) => {
-      const disabled = index === 1 && this.#annotations.length === 0;
-      const selected = index === this.#actionIndex;
-      const cursor = selected ? `${this.theme.nav.cursor} ` : "  ";
-      const text = disabled
-        ? this.theme.fg("dim", label)
-        : selected && this.#focus === "actions"
-          ? this.theme.bold(this.theme.fg("accent", label))
-          : this.theme.fg("text", label);
-      return cursor + text;
-    });
-  }
-
-  #renderAnnotationChooser(width: number): string[] {
-    const chooser = this.#annotationChooser;
-    if (!chooser) return [];
-    const options = chooser.entries.map((index, optionIndex) => {
-      const entry = this.#annotations[index];
-      if (!entry) return "";
-      const marker =
-        optionIndex === chooser.selected ? `${this.theme.nav.cursor} ` : "  ";
-      const location = this.#annotationLocation(entry);
-      const note = sanitizeStatusText(
-        entry.annotation.note.split(/\r?\n/, 1)[0] ?? "",
-      );
-      return fit(`${marker}${location} · ${note}`, width);
-    });
-    return [
-      this.theme.fg(
-        "dim",
-        "Edit annotation · ↑↓ choose · enter edit · esc cancel",
-      ),
-      ...options,
-    ];
-  }
-
-  #renderFooter(width: number): string[] {
-    if (this.#annotationChooser) {
-      return this.#renderAnnotationChooser(width);
-    }
-    if (this.#annotating) {
-      const file = this.#currentFile();
-      const source = this.#currentSourceRows()[this.#sourceIndex];
-      const location =
-        this.#annotationScope === "file"
-          ? file
-            ? `${displayFileLabel(file)} · file`
-            : "file"
-          : source && file
-            ? `${displayFileLabel(file)} · ${source.oldLine ?? "-"}/${source.newLine ?? "-"}`
-            : "diff row";
-      const action =
-        this.#editingAnnotationIndex === undefined
-          ? this.#annotationScope === "file"
-            ? "Annotate file"
-            : "Annotate line"
-          : "Edit annotation";
-      const caption = truncateToWidth(
-        `${this.theme.fg("dim", action)} ${this.theme.fg("accent", sanitizeStatusText(location))}`,
-        width,
-        Ellipsis.Unicode,
-      );
-      const hints = ["enter save", "shift+enter newline", "esc cancel"];
-      hints.push("ctrl+g editor");
-      if (
-        this.#externalEditorLabel &&
-        this.#externalEditorLabel.toLowerCase() !== "ctrl+g"
-      )
-        hints.push(`${this.#externalEditorLabel} editor`);
-      this.#editor.focused = true;
-      return [
-        caption,
-        ...this.#editor.render(width),
-        this.theme.fg("dim", hints.join(" · ")),
-      ];
-    }
-    const focusHelp =
-      this.#focus === "files"
-        ? "↑↓ file · ⏎ diff · a/A file note · e edit note"
-        : this.#focus === "diff"
-          ? "↑↓ line · ⇧ faster · pgup/pgdn · g/G ends · a line note · A file note · e edit note"
-          : "↑↓ select · ⏎ confirm";
-    return [
-      this.theme.fg(
-        "dim",
-        `${focusHelp} · ctrl+o open file · [/] file · u undo · tab regions · esc cancel`,
-      ),
-    ];
-  }
-
   render(width: number): readonly string[] {
     const terminalHeight = process.stdout.rows || 40;
-    this.#sidebarShown = this.#canShowSidebar(width);
+    this.#sidebarShown = this.#textSource ? false : this.#canShowSidebar(width);
     if (!this.#sidebarShown && this.#focus === "files") this.#focus = "diff";
     const sidebarWidth = this.#sidebarShown ? this.#sidebarWidth(width) : 0;
     const innerWidth = Math.max(1, width - 4);
@@ -947,16 +1277,27 @@ export class CodeReviewOverlay implements Component {
     const footer = this.#renderFooter(innerWidth);
     const chromeRows = 4 + 1 + ACTIONS.length + footer.length + 1;
     this.#bodyHeight = Math.max(MIN_BODY_ROWS, terminalHeight - chromeRows);
-    const renderedBody = this.#renderBody(bodyWidth);
+    const renderedBody = this.#renderBody(
+      this.#textSource ? Math.max(1, bodyWidth - 1) : bodyWidth,
+    );
     this.#scrollView.setLines(renderedBody.lines);
     this.#scrollView.setHeight(this.#bodyHeight);
+    if (this.#textSource) {
+      this.#textRenderedRowBySource = renderedBody.renderedRowBySource;
+      if (this.#textViewportDriven) this.#syncTextCursorToViewport();
+    }
     this.#ensureCursorVisible(renderedBody.renderedRowBySource);
     const body = this.#scrollView.render(bodyWidth);
     const output: string[] = [];
     if (this.#sidebarShown) {
       const sidebar = this.#renderSidebar(this.#bodyHeight + 1, sidebarWidth);
       output.push(
-        topBorderSplit(this.theme, width, OVERLAY_TITLE, sidebarWidth),
+        topBorderSplit(
+          this.theme,
+          width,
+          this.#textSource ? TEXT_OVERLAY_TITLE : OVERLAY_TITLE,
+          sidebarWidth,
+        ),
       );
       output.push(
         splitRow(
@@ -980,7 +1321,13 @@ export class CodeReviewOverlay implements Component {
       }
       output.push(dividerSplit(this.theme, width, sidebarWidth));
     } else {
-      output.push(topBorder(this.theme, width, OVERLAY_TITLE));
+      output.push(
+        topBorder(
+          this.theme,
+          width,
+          this.#textSource ? TEXT_OVERLAY_TITLE : OVERLAY_TITLE,
+        ),
+      );
       output.push(
         row(this.theme, this.#renderCurrentFileHeader(innerWidth), width),
       );

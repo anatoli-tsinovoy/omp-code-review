@@ -24,11 +24,16 @@ import {
   PASTE_CODE_REVIEW_ACTION,
 } from "../src/overlay";
 import type { CodeReviewOverlayResult, ReviewDiffFile } from "../src/types";
-
+import type {
+  TextReviewOverlayResult,
+  TextReviewSource,
+} from "../src/text-types";
 const DOWN = "\x1b[B";
 const ENTER = "\r";
 const TAB = "\t";
 const SHIFT_ENTER = "\x1b[13;2~";
+const PAGE_DOWN = "\x1b[6~";
+const PAGE_UP = "\x1b[5~";
 const ESC = "\x1b";
 
 let darkTheme: Theme | undefined;
@@ -63,6 +68,32 @@ function makeOverlay(
     options.keybindings ?? KeybindingsManager.inMemory(),
     options.files ?? parseReviewDiffSnapshot(diff).files,
     "Reviewing changes",
+    {
+      onComplete: options.onComplete ?? (() => {}),
+      onWarning: options.onWarning,
+    },
+  );
+}
+function makeTextOverlay(
+  sourceText: string,
+  options: {
+    onComplete?: (result: TextReviewOverlayResult | undefined) => void;
+    onWarning?: (message: string) => void;
+    tui?: TUI;
+    keybindings?: KeybindingsManager;
+  } = {},
+): CodeReviewOverlay {
+  const source: TextReviewSource = {
+    id: "test-source",
+    kind: "message",
+    label: "Latest assistant reply",
+    text: sourceText,
+  };
+  return new CodeReviewOverlay(
+    options.tui ?? ({} as TUI),
+    theme(),
+    options.keybindings ?? KeybindingsManager.inMemory(),
+    source,
     {
       onComplete: options.onComplete ?? (() => {}),
       onWarning: options.onWarning,
@@ -522,5 +553,122 @@ rename to src/new-name.ts`,
 
     overlay.handleInput(ESC);
     expect(completed).toEqual([undefined]);
+  });
+
+  it("wraps frozen plain text while preserving CRLF line anchors", () => {
+    const completed: Array<TextReviewOverlayResult | undefined> = [];
+    const text = `  ${"long paragraph ".repeat(12)}\r\n\r\n  tail source line`;
+    const overlay = makeTextOverlay(text, {
+      onComplete: (result) => completed.push(result),
+    });
+
+    const narrow = renderLines(overlay, 45);
+    expect(narrow.every((line) => Bun.stringWidth(line) <= 45)).toBe(true);
+    expect(narrow.join("\n")).toContain("Latest assistant reply");
+    expect(narrow.join("\n")).not.toContain("+0/-0");
+    expect(
+      narrow.filter((line) => line.includes("paragraph")).length,
+    ).toBeGreaterThan(1);
+
+    overlay.handleInput("j");
+    overlay.handleInput("j");
+    overlay.handleInput("a");
+    overlay.handleInput("line note");
+    overlay.handleInput(ENTER);
+    overlay.handleInput("A");
+    overlay.handleInput("whole text note");
+    overlay.handleInput(ENTER);
+
+    expect(overlay.getTextAnnotations()).toEqual([
+      {
+        scope: "line",
+        line: 3,
+        quote: "  tail source line",
+        note: "line note",
+      },
+      { scope: "text", note: "whole text note" },
+    ]);
+    expect(render(overlay, 90)).toContain("tail source line");
+
+    overlay.handleInput(TAB);
+    overlay.handleInput(DOWN);
+    overlay.handleInput(ENTER);
+    expect(completed).toEqual([
+      {
+        action: "paste",
+        annotations: overlay.getTextAnnotations(),
+      },
+    ]);
+  });
+
+  it("pages through one wrapped logical line without losing its anchor", () => {
+    const text = `head-marker ${"middle ".repeat(700)} tail-marker`;
+    const overlay = makeTextOverlay(text);
+
+    const initial = render(overlay, 38);
+    expect(initial).toContain("head-marker");
+    expect(initial).not.toContain("tail-marker");
+    for (let index = 0; index < 20; index++) {
+      overlay.handleInput(PAGE_DOWN);
+    }
+    const tail = render(overlay, 38);
+    expect(tail).toContain("tail-marker");
+    for (let index = 0; index < 20; index++) {
+      overlay.handleInput(PAGE_UP);
+    }
+    expect(render(overlay, 38)).toContain("head-marker");
+    overlay.handleInput("a");
+    overlay.handleInput("anchor note");
+    overlay.handleInput(ENTER);
+    expect(overlay.getTextAnnotations()).toEqual([
+      {
+        scope: "line",
+        line: 1,
+        quote: text,
+        note: "anchor note",
+      },
+    ]);
+    const multi = makeTextOverlay(
+      `first logical line ${"content ".repeat(500)}\nsecond-marker`,
+    );
+    render(multi, 38);
+    for (let index = 0; index < 20; index++) {
+      multi.handleInput(PAGE_DOWN);
+    }
+    multi.handleInput("a");
+    multi.handleInput("second-line note");
+    multi.handleInput(ENTER);
+    expect(multi.getTextAnnotations()).toEqual([
+      {
+        scope: "line",
+        line: 2,
+        quote: "second-marker",
+        note: "second-line note",
+      },
+    ]);
+  });
+
+  it("offers text and line annotations through the existing edit chooser", () => {
+    const overlay = makeTextOverlay("first line\nsecond line");
+
+    render(overlay, 42);
+    overlay.handleInput("A");
+    overlay.handleInput("text note");
+    overlay.handleInput(ENTER);
+    overlay.handleInput("a");
+    overlay.handleInput("line note");
+    overlay.handleInput(ENTER);
+
+    overlay.handleInput("e");
+    const chooser = render(overlay, 42);
+    expect(chooser).toContain("Edit annotation");
+    expect(chooser).toContain("Latest assistant reply · line 1");
+    expect(chooser).toContain("Latest assistant reply · text");
+    overlay.handleInput(ESC);
+    expect(overlay.getTextAnnotations()).toEqual([
+      { scope: "text", note: "text note" },
+      { scope: "line", line: 1, quote: "first line", note: "line note" },
+    ]);
+    expect(render(overlay, 42)).not.toContain("ctrl+o open file");
   });
 });
