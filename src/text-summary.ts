@@ -1,15 +1,17 @@
-import { settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import {
-  DEFAULT_TINY_TITLE_LOCAL_MODEL_KEY,
-  isTinyLocalModelKey,
-} from "@oh-my-pi/pi-coding-agent/tiny/models";
-import { tinyModelClient } from "@oh-my-pi/pi-coding-agent/tiny/model-client";
 import { normalizeTextReviewContextSummary } from "./text-review";
 
 export async function generateTextReviewContextSummary(
   sourceText: string,
   signal?: AbortSignal,
 ): Promise<string | undefined> {
+  // Released hosts may lack this optional SDK capability. Defer resolution so
+  // import failures reach the caller's verbatim fallback, not plugin startup.
+  const { tinyModelClient } =
+    await import("@oh-my-pi/pi-coding-agent/tiny/model-client");
+  const { settings } =
+    await import("@oh-my-pi/pi-coding-agent/config/settings");
+  const { DEFAULT_TINY_TITLE_LOCAL_MODEL_KEY, isTinyLocalModelKey } =
+    await import("@oh-my-pi/pi-coding-agent/tiny/models");
   const configured = settings.get("providers.tinyModel");
   const model =
     configured && isTinyLocalModelKey(configured)
