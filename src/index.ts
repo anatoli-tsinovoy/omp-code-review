@@ -9,13 +9,18 @@ import {
   buildReviewPrompt,
   formatCodeReviewAnnotations,
 } from "./prompt";
-import { buildTextReviewPrompt } from "./text-review";
+import {
+  buildTextReviewPrompt,
+  normalizeTextReviewContextSummary,
+  shouldSummarizeTextReviewSource,
+} from "./text-review";
+import { generateTextReviewContextSummary } from "./text-summary";
 import {
   createClipboardTextReviewSource,
   getLatestAssistantReply,
   selectSessionTextReviewSource,
-  selectTextReviewSourceKind,
-  type TextReviewSourceKind,
+  selectAnnotationSourceKind,
+  type AnnotationSourceKind,
 } from "./text-source";
 import {
   resolveLocalReviewTarget,
@@ -51,20 +56,24 @@ export const defaultCodeReviewDependencies: CodeReviewDependencies = {
   showCodeReviewOverlay,
 };
 
-export interface TextReviewDependencies {
-  selectTextReviewSourceKind: typeof selectTextReviewSourceKind;
+export interface AnnotateDependencies {
+  runCodeReviewCommand: typeof runCodeReviewCommand;
+  selectAnnotationSourceKind: typeof selectAnnotationSourceKind;
   getLatestAssistantReply: typeof getLatestAssistantReply;
   selectSessionTextReviewSource: typeof selectSessionTextReviewSource;
   acquireClipboardText: typeof acquireClipboardText;
   showTextReviewOverlay: typeof showTextReviewOverlay;
+  generateTextReviewContextSummary: typeof generateTextReviewContextSummary;
 }
 
-export const defaultTextReviewDependencies: TextReviewDependencies = {
-  selectTextReviewSourceKind,
+export const defaultAnnotateDependencies: AnnotateDependencies = {
+  runCodeReviewCommand,
+  selectAnnotationSourceKind,
   getLatestAssistantReply,
   selectSessionTextReviewSource,
   acquireClipboardText,
   showTextReviewOverlay,
+  generateTextReviewContextSummary,
 };
 
 function createReviewTargetUI(ctx: ExtensionCommandContext): ReviewTargetUI {
@@ -128,11 +137,17 @@ export async function runCodeReviewCommand(
   pi.sendUserMessage(buildReviewPrompt(target, annotations));
 }
 
-const ANNOTATE_USAGE = "Usage: /annotate [last|session|clipboard]";
+const ANNOTATE_USAGE =
+  "Usage: /annotate [code-review [focus]|last|session|clipboard]";
 
-function parseTextReviewSourceKind(
+function parseCodeReviewFocus(args: string): string | undefined {
+  const match = args.trim().match(/^code-review(?:\s+([\s\S]*))?$/);
+  return match ? (match[1]?.trim() ?? "") : undefined;
+}
+
+function parseAnnotationSourceKind(
   args: string,
-): TextReviewSourceKind | undefined {
+): AnnotationSourceKind | undefined {
   const trimmed = args.trim();
   if (trimmed === "last" || trimmed === "session" || trimmed === "clipboard") {
     return trimmed;
@@ -145,8 +160,18 @@ export async function runAnnotateCommand(
   pi: ExtensionAPI,
   args: string,
   ctx: ExtensionCommandContext,
-  dependencies: Partial<TextReviewDependencies> = {},
+  dependencies: Partial<AnnotateDependencies> = {},
 ): Promise<void> {
+  const sourceDependencies = {
+    ...defaultAnnotateDependencies,
+    ...dependencies,
+  };
+  const codeReviewFocus = parseCodeReviewFocus(args);
+  if (codeReviewFocus !== undefined) {
+    await sourceDependencies.runCodeReviewCommand(pi, codeReviewFocus, ctx);
+    return;
+  }
+
   if (!ctx.hasUI) {
     ctx.ui.notify(
       "Text annotation requires the interactive UI. Re-run /annotate from an interactive session; no message was sent.",
@@ -155,22 +180,23 @@ export async function runAnnotateCommand(
     return;
   }
 
-  const sourceDependencies = {
-    ...defaultTextReviewDependencies,
-    ...dependencies,
-  };
   const trimmed = args.trim();
-  let kind: TextReviewSourceKind | undefined;
+  let kind: AnnotationSourceKind | undefined;
   if (trimmed.length === 0) {
-    kind = await sourceDependencies.selectTextReviewSourceKind(ctx.ui);
+    kind = await sourceDependencies.selectAnnotationSourceKind(ctx.ui);
   } else {
-    kind = parseTextReviewSourceKind(trimmed);
+    kind = parseAnnotationSourceKind(trimmed);
     if (!kind) {
       ctx.ui.notify(ANNOTATE_USAGE, "error");
       return;
     }
   }
   if (!kind) return;
+
+  if (kind === "code-review") {
+    await sourceDependencies.runCodeReviewCommand(pi, "", ctx);
+    return;
+  }
 
   let source: TextReviewSource | undefined;
   switch (kind) {
@@ -200,25 +226,58 @@ export async function runAnnotateCommand(
   if (!result) return;
   if (result.annotations.length === 0) {
     ctx.ui.notify(
-      "Add at least one annotation before submitting or pasting text feedback.",
+      "Add at least one annotation before pasting text feedback.",
       "warning",
     );
     return;
   }
 
-  const prompt = buildTextReviewPrompt(source, result.annotations);
-  if (!prompt) return;
-  if (result.action === "paste") {
-    ctx.ui.pasteToEditor(prompt);
-    return;
+  let contextSummary: string | undefined;
+  if (shouldSummarizeTextReviewSource(source)) {
+    ctx.ui.setStatus(
+      "annotate-summary",
+      "Summarizing annotation source locally…",
+    );
+    try {
+      const generatedSummary =
+        await sourceDependencies.generateTextReviewContextSummary(source.text);
+      contextSummary =
+        typeof generatedSummary === "string"
+          ? normalizeTextReviewContextSummary(generatedSummary) || undefined
+          : undefined;
+      if (!contextSummary) {
+        ctx.ui.notify(
+          "Local summary unavailable; including the full source verbatim, which exceeds the normal 1000-character context budget.",
+          "warning",
+        );
+      }
+    } catch {
+      ctx.ui.notify(
+        "Local summary failed; including the full source verbatim, which exceeds the normal 1000-character context budget.",
+        "warning",
+      );
+    } finally {
+      ctx.ui.setStatus("annotate-summary", undefined);
+    }
   }
-  pi.sendUserMessage(prompt);
+  const prompt = buildTextReviewPrompt(
+    source,
+    result.annotations,
+    contextSummary,
+  );
+  if (!prompt) return;
+  ctx.ui.pasteToEditor(prompt);
 }
 
-function textReviewArgumentCompletions(argumentPrefix: string) {
+function annotateArgumentCompletions(argumentPrefix: string) {
   if (argumentPrefix.includes(" ")) return null;
   const prefix = argumentPrefix.trim().toLowerCase();
   const choices = [
+    {
+      value: "code-review",
+      label: "code-review",
+      description: "Annotate a local diff before review",
+    },
     {
       value: "last",
       label: "last",
@@ -241,16 +300,12 @@ function textReviewArgumentCompletions(argumentPrefix: string) {
   return filtered.length > 0 ? filtered : null;
 }
 
-export default function registerCodeReviewExtension(pi: ExtensionAPI): void {
-  pi.setLabel("Code Review");
-  pi.registerCommand("code-review", {
-    description: "Annotate a diff before review",
-    handler: (args, ctx) => runCodeReviewCommand(pi, args, ctx),
-  });
+export default function registerAnnotateExtension(pi: ExtensionAPI): void {
+  pi.setLabel("Annotate");
   pi.registerCommand("annotate", {
     description:
-      "Annotate text from the latest reply, session, or clipboard [last|session|clipboard]",
-    getArgumentCompletions: textReviewArgumentCompletions,
+      "Annotate a diff or text from the latest reply, session, or clipboard [code-review [focus]|last|session|clipboard]",
+    getArgumentCompletions: annotateArgumentCompletions,
     handler: (args, ctx) => runAnnotateCommand(pi, args, ctx),
   });
 }

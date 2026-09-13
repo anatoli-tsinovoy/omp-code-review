@@ -354,7 +354,14 @@ diff --git a/src/beta.ts b/src/beta.ts
     expect(staticDiffCalls()).toBe(firstFileCalls + 1);
   });
 
-  it("keeps paste disabled until a note exists and undo disables it again", () => {
+  it("keeps paste disabled until a note exists, ignores empty notes, and undo disables it again", () => {
+    const blank = makeOverlay(oneLineDiff);
+    render(blank);
+    blank.handleInput(TAB);
+    blank.handleInput("a");
+    blank.handleInput(ENTER);
+    expect(blank.getAnnotations()).toEqual([]);
+
     const disabledCompletions: Array<CodeReviewOverlayResult | undefined> = [];
     const disabled = makeOverlay(oneLineDiff, {
       onComplete: (result) => disabledCompletions.push(result),
@@ -393,6 +400,62 @@ diff --git a/src/beta.ts b/src/beta.ts
     expect(undo.getAnnotations()).toHaveLength(1);
     undo.handleInput("u");
     expect(undo.getAnnotations()).toEqual([]);
+  });
+  it("wraps frozen plain text while preserving CRLF line anchors", () => {
+    const completed: Array<TextReviewOverlayResult | undefined> = [];
+    const text = `  ${"long paragraph ".repeat(12)}\r\n\r\n  tail source line`;
+    const overlay = makeTextOverlay(text, {
+      onComplete: (result) => completed.push(result),
+    });
+
+    const initial = render(overlay);
+    expect(initial).toContain("Annotate Text");
+    expect(initial).toContain("Annotating text");
+    expect(initial).not.toContain(CONTINUE_CODE_REVIEW_ACTION);
+    expect(initial).toContain(PASTE_CODE_REVIEW_ACTION);
+    overlay.handleInput(TAB);
+    overlay.handleInput(ENTER);
+    expect(completed).toEqual([]);
+    overlay.handleInput(TAB);
+
+    const narrow = renderLines(overlay, 45);
+    expect(narrow.every((line) => Bun.stringWidth(line) <= 45)).toBe(true);
+    expect(narrow.join("\n")).toContain("Latest assistant reply");
+    expect(narrow.join("\n")).not.toContain("+0/-0");
+    expect(
+      narrow.filter((line) => line.includes("paragraph")).length,
+    ).toBeGreaterThan(1);
+
+    overlay.handleInput("j");
+    overlay.handleInput("j");
+    overlay.handleInput("a");
+    overlay.handleInput("line note");
+    overlay.handleInput(ENTER);
+    overlay.handleInput("A");
+    overlay.handleInput("whole text note");
+    overlay.handleInput(ENTER);
+
+    expect(overlay.getTextAnnotations()).toEqual([
+      {
+        scope: "line",
+        line: 3,
+        quote: "  tail source line",
+        note: "line note",
+      },
+      { scope: "text", note: "whole text note" },
+    ]);
+    expect(render(overlay, 90)).toContain("tail source line");
+
+    overlay.handleInput(TAB);
+    overlay.handleInput(DOWN);
+    overlay.handleInput("k");
+    overlay.handleInput(ENTER);
+    expect(completed).toEqual([
+      {
+        action: "paste",
+        annotations: overlay.getTextAnnotations(),
+      },
+    ]);
   });
 
   it("uses explicit Ctrl+G for the external editor and returns its draft", async () => {
@@ -553,52 +616,6 @@ rename to src/new-name.ts`,
 
     overlay.handleInput(ESC);
     expect(completed).toEqual([undefined]);
-  });
-
-  it("wraps frozen plain text while preserving CRLF line anchors", () => {
-    const completed: Array<TextReviewOverlayResult | undefined> = [];
-    const text = `  ${"long paragraph ".repeat(12)}\r\n\r\n  tail source line`;
-    const overlay = makeTextOverlay(text, {
-      onComplete: (result) => completed.push(result),
-    });
-
-    const narrow = renderLines(overlay, 45);
-    expect(narrow.every((line) => Bun.stringWidth(line) <= 45)).toBe(true);
-    expect(narrow.join("\n")).toContain("Latest assistant reply");
-    expect(narrow.join("\n")).not.toContain("+0/-0");
-    expect(
-      narrow.filter((line) => line.includes("paragraph")).length,
-    ).toBeGreaterThan(1);
-
-    overlay.handleInput("j");
-    overlay.handleInput("j");
-    overlay.handleInput("a");
-    overlay.handleInput("line note");
-    overlay.handleInput(ENTER);
-    overlay.handleInput("A");
-    overlay.handleInput("whole text note");
-    overlay.handleInput(ENTER);
-
-    expect(overlay.getTextAnnotations()).toEqual([
-      {
-        scope: "line",
-        line: 3,
-        quote: "  tail source line",
-        note: "line note",
-      },
-      { scope: "text", note: "whole text note" },
-    ]);
-    expect(render(overlay, 90)).toContain("tail source line");
-
-    overlay.handleInput(TAB);
-    overlay.handleInput(DOWN);
-    overlay.handleInput(ENTER);
-    expect(completed).toEqual([
-      {
-        action: "paste",
-        annotations: overlay.getTextAnnotations(),
-      },
-    ]);
   });
 
   it("pages through one wrapped logical line without losing its anchor", () => {

@@ -1,4 +1,5 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import {
   extractBlocks,
   extractLastCommand,
@@ -12,9 +13,15 @@ import type {
 
 import type { TextReviewSource } from "./text-types";
 
-export type TextReviewSourceKind = "last" | "session" | "clipboard";
+export type AnnotationSourceKind =
+  "code-review" | "last" | "session" | "clipboard";
 
-export const TEXT_REVIEW_SOURCE_CHOICES = [
+export const ANNOTATION_SOURCE_CHOICES = [
+  {
+    kind: "code-review",
+    label: "Code review",
+    description: "Annotate a local diff before review",
+  },
   {
     kind: "last",
     label: "Latest assistant reply",
@@ -32,7 +39,7 @@ export const TEXT_REVIEW_SOURCE_CHOICES = [
     description: "Read text from the system clipboard",
   },
 ] as const satisfies readonly {
-  kind: TextReviewSourceKind;
+  kind: AnnotationSourceKind;
   label: string;
   description: string;
 }[];
@@ -59,14 +66,14 @@ export function sanitizeTextReviewPreviewLabel(
 }
 
 /** Show the top-level source picker used by `/annotate` without arguments. */
-export async function selectTextReviewSourceKind(
+export async function selectAnnotationSourceKind(
   ui: Pick<TextReviewSourceUI, "select">,
-): Promise<TextReviewSourceKind | undefined> {
+): Promise<AnnotationSourceKind | undefined> {
   const selected = await ui.select(
-    "Select text to annotate",
-    TEXT_REVIEW_SOURCE_CHOICES.map((choice) => choice.label),
+    "Select content to annotate",
+    ANNOTATION_SOURCE_CHOICES.map((choice) => choice.label),
   );
-  return TEXT_REVIEW_SOURCE_CHOICES.find((choice) => choice.label === selected)
+  return ANNOTATION_SOURCE_CHOICES.find((choice) => choice.label === selected)
     ?.kind;
 }
 
@@ -90,30 +97,43 @@ function assistantText(message: AgentMessage): string | undefined {
  * Find the latest non-empty assistant reply on the active branch.
  * Thinking, tool calls, tool results, and all sibling branches are excluded.
  */
-export function getLatestAssistantReply(
-  ctx: ExtensionCommandContext,
-): TextReviewSource | undefined {
-  const branch = ctx.sessionManager.getBranch();
-
+function latestAssistantMessageEntry(branch: readonly SessionEntry[]):
+  | {
+      entry: Extract<SessionEntry, { type: "message" }>;
+      text: string;
+    }
+  | undefined {
   for (let index = branch.length - 1; index >= 0; index--) {
     const entry = branch[index];
     if (entry?.type !== "message") continue;
     const text = assistantText(entry.message);
     if (!text) continue;
-
-    return {
-      id: `latest:${entry.id}`,
-      kind: "message",
-      label: "Latest assistant reply",
-      text,
-      sessionId: getSessionId(ctx),
-    };
+    return { entry, text };
   }
-
   return undefined;
+}
+export function getLatestAssistantReply(
+  ctx: ExtensionCommandContext,
+): TextReviewSource | undefined {
+  const latest = latestAssistantMessageEntry(ctx.sessionManager.getBranch());
+  if (!latest) return undefined;
+
+  return {
+    id: `latest:${latest.entry.id}`,
+    kind: "message",
+    label: "Latest assistant reply",
+    text: latest.text,
+    provenance: {
+      kind: "latest-assistant",
+      entryId: latest.entry.id,
+    },
+    sessionId: getSessionId(ctx),
+  };
 }
 export interface TextReviewCopyTarget {
   id: string;
+  /** The session message entry containing this target, when applicable. */
+  messageEntryId?: string;
   label: string;
   hint?: string;
   preview: string;
@@ -140,6 +160,7 @@ function commandLabel(command: LastCommand): string {
 
 function childTargetForBlock(
   parentId: string,
+  messageEntryId: string,
   block: MessageBlock,
   blockIndex: number,
 ): TextReviewCopyTarget {
@@ -147,6 +168,7 @@ function childTargetForBlock(
     const lines = textLines(block.code);
     return {
       id: `${parentId}:code:${blockIndex}`,
+      messageEntryId,
       label: block.lang ? `${block.lang} code` : "Code block",
       hint: `${lines} line${lines === 1 ? "" : "s"}`,
       preview: block.code,
@@ -158,6 +180,7 @@ function childTargetForBlock(
   const lines = textLines(block.text);
   return {
     id: `${parentId}:quote:${blockIndex}`,
+    messageEntryId,
     label: "Quote block",
     hint: `${lines} line${lines === 1 ? "" : "s"}`,
     preview: block.text,
@@ -167,11 +190,13 @@ function childTargetForBlock(
 
 function commandTarget(
   parentId: string,
+  messageEntryId: string,
   command: LastCommand,
   commandIndex: number,
 ): TextReviewCopyTarget {
   return {
     id: `cmd:${parentId}:${commandIndex}`,
+    messageEntryId,
     label: commandLabel(command),
     hint: command.kind,
     preview: command.code,
@@ -182,6 +207,7 @@ function commandTarget(
 
 function messageTarget(
   id: string,
+  messageEntryId: string,
   role: "user" | "assistant",
   text: string | undefined,
   message: AgentMessage,
@@ -195,7 +221,7 @@ function messageTarget(
     let quoteIndex = 0;
     for (const block of extractBlocks(text)) {
       const blockIndex = block.kind === "code" ? codeIndex++ : quoteIndex++;
-      const target = childTargetForBlock(id, block, blockIndex);
+      const target = childTargetForBlock(id, messageEntryId, block, blockIndex);
       children.push(target);
       if (block.kind === "code") codeBlocks.push(target);
       else quoteBlocks.push(target);
@@ -216,7 +242,7 @@ function messageTarget(
         },
       ]);
       if (!command) continue;
-      children.push(commandTarget(id, command, commandIndex));
+      children.push(commandTarget(id, messageEntryId, command, commandIndex));
       commandIndex += 1;
     }
   }
@@ -228,6 +254,7 @@ function messageTarget(
     const lines = textLines(combined);
     children.push({
       id: `${id}:all`,
+      messageEntryId,
       label: `All ${codeBlocks.length} code blocks`,
       hint: `${lines} line${lines === 1 ? "" : "s"}`,
       preview: combined,
@@ -241,6 +268,7 @@ function messageTarget(
     const lines = textLines(combined);
     children.push({
       id: `${id}:all-quotes`,
+      messageEntryId,
       label: `All ${quoteBlocks.length} quote blocks`,
       hint: `${lines} line${lines === 1 ? "" : "s"}`,
       preview: combined,
@@ -250,12 +278,13 @@ function messageTarget(
 
   if (!text && children.length === 0) return undefined;
 
-  // `/copy` trims assistant prose for its whole-message target, while user
-  // messages preserve the raw text blocks.
-  const content = role === "assistant" ? text?.trim() : text;
+  // Preserve the source text exactly; labels and previews may sanitize it for
+  // display, but annotation quotes must retain the selected content.
+  const content = text;
   const lines = content === undefined ? 0 : textLines(content);
   return {
     id,
+    messageEntryId,
     label:
       firstLine(content ?? "") ||
       `${role === "assistant" ? "Assistant" : "User"} message`,
@@ -283,11 +312,10 @@ function messageText(message: AgentMessage): string | undefined {
 }
 
 /** Build the current `/copy`-compatible text tree from the active branch. */
-export function buildSessionTextReviewTargets(
-  ctx: ExtensionCommandContext,
+function buildSessionTextReviewTargetsFromBranch(
+  branch: readonly SessionEntry[],
 ): TextReviewCopyTarget[] {
   const targets: TextReviewCopyTarget[] = [];
-  const branch = ctx.sessionManager.getBranch();
 
   // `/copy` presents recent transcript material first. The entry id remains
   // part of every target id, so selecting a target is stable if labels collide.
@@ -298,6 +326,7 @@ export function buildSessionTextReviewTargets(
     if (message.role !== "user" && message.role !== "assistant") continue;
     const target = messageTarget(
       `msg:${entry.id}`,
+      entry.id,
       message.role,
       messageText(message),
       message,
@@ -305,6 +334,13 @@ export function buildSessionTextReviewTargets(
     if (target) targets.push(target);
   }
   return targets;
+}
+export function buildSessionTextReviewTargets(
+  ctx: ExtensionCommandContext,
+): TextReviewCopyTarget[] {
+  return buildSessionTextReviewTargetsFromBranch(
+    ctx.sessionManager.getBranch(),
+  );
 }
 
 function targetKind(target: TextReviewCopyTarget): TextReviewSource["kind"] {
@@ -417,13 +453,30 @@ async function selectTargetFromTree(
 function sourceFromCopyTarget(
   target: TextReviewCopyTarget,
   sessionId: string,
+  latestAssistantEntryId?: string,
 ): TextReviewSource | undefined {
   if (target.content === undefined) return undefined;
+
+  const kind = targetKind(target);
+  const provenance: TextReviewSource["provenance"] =
+    target.messageEntryId === undefined
+      ? undefined
+      : target.messageEntryId === latestAssistantEntryId && kind === "message"
+        ? {
+            kind: "latest-assistant",
+            entryId: target.messageEntryId,
+          }
+        : {
+            kind: "session",
+            entryId: target.messageEntryId,
+          };
+
   return {
     id: target.id,
-    kind: targetKind(target),
-    label: `${targetTypeLabel(target)} [${target.id}]`,
+    kind,
+    label: `${targetTypeLabel(target)}: ${target.label}`,
     text: target.content,
+    provenance,
     sessionId,
   };
 }
@@ -432,7 +485,13 @@ function sourceFromCopyTarget(
 export async function selectSessionTextReviewSource(
   ctx: ExtensionCommandContext,
 ): Promise<TextReviewSource | undefined> {
-  const targets = buildSessionTextReviewTargets(ctx);
+  // Keep this branch snapshot for both target construction and latest-message
+  // provenance. The picker is asynchronous, so querying the branch afterward
+  // could classify a newly appended message instead of the displayed target.
+  const branch = ctx.sessionManager.getBranch();
+  const sessionId = getSessionId(ctx);
+  const latestAssistantEntryId = latestAssistantMessageEntry(branch)?.entry.id;
+  const targets = buildSessionTextReviewTargetsFromBranch(branch);
   if (targets.length === 0) {
     ctx.ui.notify(
       "No assistant or user messages with copyable text are available on the active session branch.",
@@ -443,10 +502,10 @@ export async function selectSessionTextReviewSource(
 
   const target = await selectTargetFromTree(ctx.ui, targets);
   if (!target) return undefined;
-  return sourceFromCopyTarget(target, getSessionId(ctx));
+  return sourceFromCopyTarget(target, sessionId, latestAssistantEntryId);
 }
 
-/** Freeze clipboard text as a distinct annotation source. */
+/** Capture clipboard text as a distinct annotation source. */
 export function createClipboardTextReviewSource(
   ctx: ExtensionCommandContext,
   text: string,
@@ -456,6 +515,7 @@ export function createClipboardTextReviewSource(
     kind: "clipboard",
     label: "Clipboard text",
     text,
+    provenance: { kind: "clipboard" },
     sessionId: getSessionId(ctx),
   };
 }

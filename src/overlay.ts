@@ -91,15 +91,16 @@ type FocusRegion = "files" | "diff" | "actions";
 const SOURCE_SELECTION_GUTTER_WIDTH = 2;
 
 const OVERLAY_TITLE = "Code Review";
-const TEXT_OVERLAY_TITLE = "Text Review";
+const TEXT_OVERLAY_TITLE = "Annotate Text";
 const MIN_BODY_ROWS = 3;
 const SIDEBAR_MIN_TOTAL_WIDTH = 64;
 const SIDEBAR_MIN_BODY_WIDTH = 40;
 const MAX_ANNOTATION_EDITOR_ROWS = 6;
-const ACTIONS = [
+const CODE_REVIEW_ACTIONS = [
   CONTINUE_CODE_REVIEW_ACTION,
   PASTE_CODE_REVIEW_ACTION,
 ] as const;
+const TEXT_REVIEW_ACTIONS = [PASTE_CODE_REVIEW_ACTION] as const;
 
 function isSourceRow(row: ReviewDiffRow): row is ReviewSourceRow {
   return (
@@ -145,6 +146,7 @@ export class CodeReviewOverlay implements Component {
   #finished = false;
   #annotations: CommittedAnnotation[] = [];
   #textAnnotations: CommittedTextAnnotation[] = [];
+  #actions: readonly string[] = CODE_REVIEW_ACTIONS;
   #textSource: TextReviewSource | undefined;
   #textLines: readonly string[] = [];
   #textViewportDriven = false;
@@ -187,7 +189,8 @@ export class CodeReviewOverlay implements Component {
     this.keybindings = keybindings;
     if (isTextSource(filesOrSource)) {
       this.files = [];
-      this.mode = "Reviewing text";
+      this.#actions = TEXT_REVIEW_ACTIONS;
+      this.mode = "Annotating text";
       this.callbacks = modeOrCallbacks as TextReviewOverlayCallbacks;
       this.#textSource = { ...filesOrSource };
       this.#textLines = splitTextLines(filesOrSource.text);
@@ -458,28 +461,39 @@ export class CodeReviewOverlay implements Component {
   }
 
   #handleActions(data: string): void {
-    if (
-      this.keybindings.matches(data, "tui.select.up") ||
-      matchesKey(data, "k")
-    ) {
-      this.#actionIndex = 0;
-      return;
-    }
+    const actionCount = this.#actions.length;
+    if (actionCount === 0) return;
     const hasAnnotations = this.#textSource
       ? this.#textAnnotations.length > 0
       : this.#annotations.length > 0;
     if (
+      this.keybindings.matches(data, "tui.select.up") ||
+      matchesKey(data, "k")
+    ) {
+      this.#actionIndex = this.#textSource
+        ? (this.#actionIndex - 1 + actionCount) % actionCount
+        : 0;
+      return;
+    }
+    if (
       this.keybindings.matches(data, "tui.select.down") ||
       matchesKey(data, "j")
     ) {
-      if (hasAnnotations) this.#actionIndex = 1;
+      if (this.#textSource) {
+        this.#actionIndex = (this.#actionIndex + 1) % actionCount;
+      } else if (hasAnnotations) {
+        this.#actionIndex = Math.min(actionCount - 1, this.#actionIndex + 1);
+      }
       return;
     }
     if (this.keybindings.matches(data, "tui.select.confirm")) {
-      if (this.#actionIndex === 1 && !hasAnnotations) return;
+      const disabled = this.#textSource
+        ? !hasAnnotations
+        : this.#actionIndex === 1 && !hasAnnotations;
+      if (disabled) return;
       if (this.#textSource) {
         this.#finish({
-          action: this.#actionIndex === 0 ? "review" : "paste",
+          action: "paste",
           annotations: this.getTextAnnotations(),
         });
       } else {
@@ -1094,8 +1108,10 @@ export class CodeReviewOverlay implements Component {
     const hasAnnotations = this.#textSource
       ? this.#textAnnotations.length > 0
       : this.#annotations.length > 0;
-    return ACTIONS.map((label, index) => {
-      const disabled = index === 1 && !hasAnnotations;
+    return this.#actions.map((label, index) => {
+      const disabled = this.#textSource
+        ? !hasAnnotations
+        : index === 1 && !hasAnnotations;
       const selected = index === this.#actionIndex;
       const cursor = selected ? `${this.theme.nav.cursor} ` : "  ";
       const text = disabled
@@ -1275,7 +1291,7 @@ export class CodeReviewOverlay implements Component {
     );
     this.#editor.focused = this.#annotating;
     const footer = this.#renderFooter(innerWidth);
-    const chromeRows = 4 + 1 + ACTIONS.length + footer.length + 1;
+    const chromeRows = 4 + 1 + this.#actions.length + footer.length + 1;
     this.#bodyHeight = Math.max(MIN_BODY_ROWS, terminalHeight - chromeRows);
     const renderedBody = this.#renderBody(
       this.#textSource ? Math.max(1, bodyWidth - 1) : bodyWidth,

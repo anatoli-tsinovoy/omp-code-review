@@ -1,8 +1,8 @@
 # OMP Code Review
 
-`/code-review` is an interactive local-diff review workspace for [Oh My Pi](https://github.com/can1357/oh-my-pi). Select a diff, navigate its files and source lines, attach precise inline notes, then either continue the review with the active LLM session or place the annotations in the editor for further editing. The review uses one frozen diff snapshot, so its annotations and submitted context refer to the same changes.
+`/annotate code-review` is an interactive local-diff review workspace for [Oh My Pi](https://github.com/can1357/oh-my-pi). Select a diff, navigate its files and source lines, attach precise inline notes, then either continue the review with the active LLM session or place the annotations in the editor for further editing. The review uses one frozen diff snapshot, so its annotations and submitted context refer to the same changes.
 
-`/annotate` brings the same annotation workflow to assistant replies, session messages and blocks, and clipboard text. It works outside Git repositories.
+`/annotate` offers one source menu for code review, assistant replies, session messages and blocks, and clipboard text. Text annotation works outside Git repositories.
 
 ## Requirements
 
@@ -20,12 +20,12 @@ omp plugin install github:anatoli-tsinovoy/omp-code-review
 Start a new OMP session in the repository you want to review, then run:
 
 ```text
-/code-review
+/annotate
 ```
 
 ## Use
 
-Choose one of the available review targets:
+Choose **Code review** from the source menu, or run `/annotate code-review` directly, then choose a review target. Optional trailing text focuses the review, for example `/annotate code-review focus on error handling`.
 
 1. **Base branch (PR style)** — choose a Git base branch; the plugin reviews the three-dot comparison from that branch to the current branch.
 2. **Uncommitted changes** — reviews both staged and unstaged Git changes. In a JJ repository, it reviews the JJ working-copy diff.
@@ -74,18 +74,32 @@ External-editor changes return to the annotation draft; press `Enter` to save or
 
 ## Annotate messages and clipboard text
 
-| Command               | Source                                                                                               |
-| --------------------- | ---------------------------------------------------------------------------------------------------- |
-| `/annotate`           | Choose a source                                                                                      |
-| `/annotate last`      | Latest non-empty assistant reply on the active branch                                                |
-| `/annotate session`   | Choose a user/assistant message, fenced code block, quote, or Bash/eval command on the active branch |
-| `/annotate clipboard` | Read local clipboard text, or open a paste editor                                                    |
+| Command                         | Source                                                                                               |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `/annotate`                     | Choose a source                                                                                      |
+| `/annotate code-review [focus]` | Review a local diff, optionally with a review focus                                                  |
+| `/annotate last`                | Latest non-empty assistant reply on the active branch                                                |
+| `/annotate session`             | Choose a user/assistant message, fenced code block, quote, or Bash/eval command on the active branch |
+| `/annotate clipboard`           | Read local clipboard text, or open a paste editor                                                    |
 
 The session picker uses OMP's block-extraction helpers but is separate from `/copy`: the built-in menu does not expose an extension hook. It does not reproduce `/copy`'s complete transcript/tool-output browser. Sibling branches and hidden thinking are excluded. Stored message text is used, as in OMP's current `/copy` picker; provider-secret placeholders in stored history are not reconstructed.
 
 In the text workspace, `a` annotates the selected logical line and `A` annotates the whole source. `e` revisits notes, `u` undoes the last saved note, and `Ctrl+G` edits the current draft externally. Long lines wrap; `PageUp` / `PageDown` navigate visual pages while annotations retain their original logical-line anchors. `Ctrl+O` is unavailable because these sources are not working-tree files.
 
-Both **Continue with LLM review** and **Paste annotations into prompt** include the frozen source and its notes. Continue submits feedback to the session; Paste leaves it in the prompt editor without submitting. Cancelling or finishing without notes sends nothing.
+**Paste annotations into prompt** is the only completion action for messages, blocks, and clipboard text. It places passage/comment feedback in the prompt editor for you to edit and submit manually; these annotation paths never submit a message automatically. Cancelling or finishing without notes sends nothing. **Continue with LLM review** is available only for `/annotate code-review`.
+
+Prompt context depends on the selected source:
+
+- The latest assistant reply uses quoted passages and comments only, whether opened through `/annotate last` or selected in the session picker.
+- Selected code blocks and Bash/eval commands are included verbatim.
+- Other session prose and quote selections are included verbatim through 1,000 characters. Longer selections receive a local TINY-generated compact, faithful source context of fewer than 1,000 characters for grounding annotations. It preserves as much original information and detail as fits, preferring rephrasing or reformatting before omitting details, alongside the exact annotated passages and comments.
+- Clipboard text is included in full so the prompt is self-contained.
+
+Whole-text notes appear as general feedback. Source-line anchors remain internal; the prompt does not expose logical-line markers.
+
+Summaries run only after choosing to paste non-empty annotations. The configured local TINY model is used; an online setting selects OMP's default small local model instead, never a hosted fallback. Generation has a 60-second timeout. If generation returns blank or oversized output, or fails for any reason (including exceptions and timeouts), the full source is pasted verbatim with the oversized-source warning.
+
+Text summaries use OMP's dedicated generic `tinyModelClient` completion client, while title generation remains behind the title-policy `tinyTitleClient` facade. This extension therefore requires an OMP source checkout containing the unreleased generic-client split; the currently published dependency does not contain `@oh-my-pi/pi-coding-agent/tiny/model-client`. No released minimum version is claimed here—run with a source checkout that includes this change (or a later release once available) to enable small-model summaries.
 
 ### Clipboard across SSH and tmux
 
@@ -104,7 +118,7 @@ bun install
 omp plugin link .
 ```
 
-Edits in the linked checkout are used by OMP; start a new OMP session in a Git or JJ repository and invoke `/code-review` to exercise them.
+Edits in the linked checkout are used by OMP; start a new OMP session and invoke `/annotate` to exercise them. Use `/annotate code-review` in a Git or JJ repository for the diff workflow.
 
 ## Upgrade and uninstall
 
