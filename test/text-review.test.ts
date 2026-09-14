@@ -59,6 +59,25 @@ test("long older prose receives bounded grounding without replacing exact annota
   ).not.toContain(summary);
 });
 
+test("preserves exact multiline comments without formatter quote markers", () => {
+  const source: TextReviewSource = {
+    id: "reply",
+    kind: "message",
+    label: "Reply",
+    text: "source passage",
+  };
+  const quote = "quoted > source\r\n  with whitespace";
+  const note =
+    "Keep > this exact text\r\n\n  and this indentation\n> literal user prefix";
+  const prompt = buildTextReviewPrompt(source, [
+    { scope: "line", line: 1, quote, note },
+  ])!;
+
+  expect(prompt).toContain(`\`\`\`text\n${quote}\n\`\`\``);
+  expect(prompt).toContain(note);
+  expect(prompt).not.toContain("> Keep > this exact text");
+});
+
 test("blank summary falls back to the complete long session source", () => {
   const source: TextReviewSource = {
     id: "older",

@@ -514,7 +514,7 @@ describe("runAnnotateCommand", () => {
     const { ctx, pasted } = createInteractiveContext();
 
     await runAnnotateCommand(pi, "last", ctx, {
-      getLatestAssistantReply: () => source,
+      selectSessionTextReviewSource: async () => source,
       showTextReviewOverlay: async (_ctx, receivedSource) => {
         expect(receivedSource).toEqual(source);
         return { action: "paste", annotations: [textAnnotation] };

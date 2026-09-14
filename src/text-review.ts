@@ -22,19 +22,11 @@ export function markdownFenceFor(value: string): string {
   return "`".repeat(Math.max(3, longestRun + 1));
 }
 
-function renderComment(note: string): string {
-  const lines = note.split(/\r\n|\n|\r/);
-  return lines.map((line) => `> ${line}`).join("\n");
-}
-
 function renderTextAnnotation(
   annotation: Extract<TextReviewAnnotation, { scope: "text" }>,
   number: number,
 ): string {
-  return [
-    `## ${number}. General feedback`,
-    renderComment(annotation.note),
-  ].join("\n");
+  return [`## ${number}. General feedback`, annotation.note].join("\n");
 }
 
 function renderLineAnnotation(
@@ -42,7 +34,7 @@ function renderLineAnnotation(
   number: number,
 ): string {
   const heading = `## ${number}. Feedback on:`;
-  const comment = renderComment(annotation.note);
+  const comment = annotation.note;
   if (!/[\r\n`]/.test(annotation.quote)) {
     return `${heading} "${annotation.quote}"\n${comment}`;
   }

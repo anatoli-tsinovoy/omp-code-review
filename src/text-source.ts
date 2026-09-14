@@ -112,24 +112,6 @@ function latestAssistantMessageEntry(branch: readonly SessionEntry[]):
   }
   return undefined;
 }
-export function getLatestAssistantReply(
-  ctx: ExtensionCommandContext,
-): TextReviewSource | undefined {
-  const latest = latestAssistantMessageEntry(ctx.sessionManager.getBranch());
-  if (!latest) return undefined;
-
-  return {
-    id: `latest:${latest.entry.id}`,
-    kind: "message",
-    label: "Latest assistant reply",
-    text: latest.text,
-    provenance: {
-      kind: "latest-assistant",
-      entryId: latest.entry.id,
-    },
-    sessionId: getSessionId(ctx),
-  };
-}
 export interface TextReviewCopyTarget {
   id: string;
   /** The session message entry containing this target, when applicable. */
@@ -361,22 +343,86 @@ function targetTypeLabel(target: TextReviewCopyTarget): string {
   return "Message";
 }
 
-/** Build an unambiguous, selector-safe label for a copy target. */
+/** Build a content-first, selector-safe label for a copy target. */
 export function formatTextReviewTargetLabel(
   target: TextReviewCopyTarget,
   wholeMessage = false,
 ): string {
   const preview = sanitizeTextReviewPreviewLabel(
-    target.label || target.preview,
+    target.content ?? target.preview,
   );
-  const suffix = wholeMessage ? " (whole text)" : "";
-  return `${targetTypeLabel(target)} [${target.id}]${suffix}: ${preview || "(empty)"}`;
+  if (wholeMessage) return `Whole message: ${preview || "(empty)"}`;
+  if (target.id.startsWith("cmd:")) return `Command: ${preview || "(empty)"}`;
+  if (target.id.includes(":code:") || target.id.includes(":quote:")) {
+    return `Block: ${preview || "(empty)"}`;
+  }
+  if (target.id.endsWith(":all")) {
+    return `All code blocks: ${preview || "(empty)"}`;
+  }
+  if (target.id.endsWith(":all-quotes")) {
+    return `All quote blocks: ${preview || "(empty)"}`;
+  }
+  return preview || "(empty)";
 }
 
 interface TargetChoice {
   label: string;
   target: TextReviewCopyTarget;
   whole: boolean;
+}
+
+function rootChoicesForTargets(
+  targets: readonly TextReviewCopyTarget[],
+): TargetChoice[] {
+  const rootChoices: TargetChoice[] = [];
+  for (const target of targets) {
+    if (target.content !== undefined) {
+      rootChoices.push({
+        label: formatTextReviewTargetLabel(target),
+        target,
+        whole: true,
+      });
+    }
+    if (target.children && target.children.length > 0) {
+      const preview = sanitizeTextReviewPreviewLabel(
+        target.content ?? target.preview,
+      );
+      rootChoices.push({
+        label: `Blocks: ${preview || "(empty)"}`,
+        target,
+        whole: false,
+      });
+    }
+  }
+  return rootChoices;
+}
+
+function disambiguateChoiceLabels(
+  choices: readonly TargetChoice[],
+): TargetChoice[] {
+  const counts = new Map<string, number>();
+  for (const choice of choices) {
+    counts.set(choice.label, (counts.get(choice.label) ?? 0) + 1);
+  }
+
+  const usedLabels = new Set(choices.map((choice) => choice.label));
+  const duplicateLabels = new Set(
+    [...counts].filter(([, count]) => count > 1).map(([label]) => label),
+  );
+  const nextOccurrence = new Map<string, number>();
+
+  return choices.map((choice) => {
+    if (!duplicateLabels.has(choice.label)) return choice;
+    let occurrence = (nextOccurrence.get(choice.label) ?? 0) + 1;
+    let label = `(${occurrence}) ${choice.label}`;
+    while (usedLabels.has(label)) {
+      occurrence += 1;
+      label = `(${occurrence}) ${choice.label}`;
+    }
+    nextOccurrence.set(choice.label, occurrence);
+    usedLabels.add(label);
+    return { ...choice, label };
+  });
 }
 
 function choicesForTarget(target: TextReviewCopyTarget): TargetChoice[] {
@@ -388,39 +434,30 @@ function choicesForTarget(target: TextReviewCopyTarget): TargetChoice[] {
       whole: true,
     });
   }
-  if (target.children && target.children.length > 0) {
-    choices.push(
-      ...target.children.map((child) => ({
-        label: formatTextReviewTargetLabel(child),
-        target: child,
-        whole: true,
-      })),
-    );
+
+  let blockNumber = 0;
+  for (const child of target.children ?? []) {
+    const isBlock = child.id.includes(":code:") || child.id.includes(":quote:");
+    let label: string;
+    if (isBlock) {
+      blockNumber += 1;
+      const preview = sanitizeTextReviewPreviewLabel(
+        child.content ?? child.preview,
+      );
+      label = `Block #${blockNumber}: ${preview || "(empty)"}`;
+    } else {
+      label = formatTextReviewTargetLabel(child);
+    }
+    choices.push({ label, target: child, whole: true });
   }
-  return choices;
+  return disambiguateChoiceLabels(choices);
 }
 
 async function selectTargetFromTree(
   ui: Pick<TextReviewSourceUI, "select">,
   targets: readonly TextReviewCopyTarget[],
 ): Promise<TextReviewCopyTarget | undefined> {
-  const rootChoices: TargetChoice[] = [];
-  for (const target of targets) {
-    if (target.content !== undefined) {
-      rootChoices.push({
-        label: formatTextReviewTargetLabel(target, true),
-        target,
-        whole: true,
-      });
-    }
-    if (target.children && target.children.length > 0) {
-      rootChoices.push({
-        label: `${formatTextReviewTargetLabel(target)} (choose a block)`,
-        target,
-        whole: false,
-      });
-    }
-  }
+  const rootChoices = disambiguateChoiceLabels(rootChoicesForTargets(targets));
 
   const selectedRootLabel = await ui.select(
     "Select a session message or block",
@@ -484,6 +521,7 @@ function sourceFromCopyTarget(
 /** Choose a `/copy`-compatible target from the active branch. */
 export async function selectSessionTextReviewSource(
   ctx: ExtensionCommandContext,
+  options?: { autoSelect?: "latest-assistant" },
 ): Promise<TextReviewSource | undefined> {
   // Keep this branch snapshot for both target construction and latest-message
   // provenance. The picker is asynchronous, so querying the branch afterward
@@ -491,6 +529,17 @@ export async function selectSessionTextReviewSource(
   const branch = ctx.sessionManager.getBranch();
   const sessionId = getSessionId(ctx);
   const latestAssistantEntryId = latestAssistantMessageEntry(branch)?.entry.id;
+  if (
+    options?.autoSelect === "latest-assistant" &&
+    latestAssistantEntryId === undefined
+  ) {
+    ctx.ui.notify(
+      "No non-empty assistant reply is available on the active session branch.",
+      "warning",
+    );
+    return undefined;
+  }
+
   const targets = buildSessionTextReviewTargetsFromBranch(branch);
   if (targets.length === 0) {
     ctx.ui.notify(
@@ -498,6 +547,18 @@ export async function selectSessionTextReviewSource(
       "warning",
     );
     return undefined;
+  }
+
+  if (options?.autoSelect === "latest-assistant") {
+    const latestTarget = targets.find(
+      (target) =>
+        target.id === `msg:${latestAssistantEntryId}` &&
+        target.messageEntryId === latestAssistantEntryId &&
+        target.content !== undefined,
+    );
+    return latestTarget
+      ? sourceFromCopyTarget(latestTarget, sessionId, latestAssistantEntryId)
+      : undefined;
   }
 
   const target = await selectTargetFromTree(ctx.ui, targets);

@@ -78,11 +78,11 @@ External-editor changes return to the annotation draft; press `Enter` to save or
 | ------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | `/annotate`                     | Choose a source                                                                                      |
 | `/annotate code-review [focus]` | Review a local diff, optionally with a review focus                                                  |
-| `/annotate last`                | Latest non-empty assistant reply on the active branch                                                |
+| `/annotate last`                | Automatically open the latest non-empty assistant reply for annotation, without a picker             |
 | `/annotate session`             | Choose a user/assistant message, fenced code block, quote, or Bash/eval command on the active branch |
 | `/annotate clipboard`           | Read local clipboard text, or open a paste editor                                                    |
 
-The session picker uses OMP's block-extraction helpers but is separate from `/copy`: the built-in menu does not expose an extension hook. It does not reproduce `/copy`'s complete transcript/tool-output browser. Sibling branches and hidden thinking are excluded. Stored message text is used, as in OMP's current `/copy` picker; provider-secret placeholders in stored history are not reconstructed.
+`/annotate last` and `/annotate session` share source selection and resolution code. `last` automatically selects the latest non-empty assistant reply and opens its annotation workspace without rendering a picker. `session` opens the interactive picker. Picker rows lead with sanitized, truncated message or block content; messages with blocks also offer a `Blocks: <preview>` row plus `Whole message: <preview>` and numbered `Block #N: <content preview>` child rows. Command and combined-block choices include their content with a short descriptive prefix. Repeated previews receive a `(N) ` occurrence prefix only when needed, while natural labels remain unchanged. The picker uses OMP's block-extraction helpers but is separate from `/copy`: the built-in menu does not expose an extension hook. It does not reproduce `/copy`'s complete transcript/tool-output browser. Sibling branches and hidden thinking are excluded. Stored message text is used, as in OMP's current `/copy` picker; provider-secret placeholders in stored history are not reconstructed.
 
 In the text workspace, `a` annotates the selected logical line and `A` annotates the whole source. `e` revisits notes, `u` undoes the last saved note, and `Ctrl+G` edits the current draft externally. Long lines wrap; `PageUp` / `PageDown` navigate visual pages while annotations retain their original logical-line anchors. `Ctrl+O` is unavailable because these sources are not working-tree files.
 
@@ -90,7 +90,7 @@ In the text workspace, `a` annotates the selected logical line and `A` annotates
 
 Prompt context depends on the selected source:
 
-- The latest assistant reply uses quoted passages and comments only, whether opened through `/annotate last` or selected in the session picker.
+- The latest assistant reply uses quoted passages and comments only, whether automatically selected by `/annotate last` or chosen in the session picker.
 - Selected code blocks and Bash/eval commands are included verbatim.
 - Other session prose and quote selections are included verbatim through 1,000 characters. Longer selections receive a local TINY-generated compact, faithful source context of fewer than 1,000 characters for grounding annotations. It preserves as much original information and detail as fits, preferring rephrasing or reformatting before omitting details, alongside the exact annotated passages and comments.
 - Clipboard text is included in full so the prompt is self-contained.

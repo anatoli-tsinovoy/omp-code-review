@@ -17,7 +17,6 @@ import {
 import { generateTextReviewContextSummary } from "./text-summary";
 import {
   createClipboardTextReviewSource,
-  getLatestAssistantReply,
   selectSessionTextReviewSource,
   selectAnnotationSourceKind,
   type AnnotationSourceKind,
@@ -59,7 +58,6 @@ export const defaultCodeReviewDependencies: CodeReviewDependencies = {
 export interface AnnotateDependencies {
   runCodeReviewCommand: typeof runCodeReviewCommand;
   selectAnnotationSourceKind: typeof selectAnnotationSourceKind;
-  getLatestAssistantReply: typeof getLatestAssistantReply;
   selectSessionTextReviewSource: typeof selectSessionTextReviewSource;
   acquireClipboardText: typeof acquireClipboardText;
   showTextReviewOverlay: typeof showTextReviewOverlay;
@@ -69,7 +67,6 @@ export interface AnnotateDependencies {
 export const defaultAnnotateDependencies: AnnotateDependencies = {
   runCodeReviewCommand,
   selectAnnotationSourceKind,
-  getLatestAssistantReply,
   selectSessionTextReviewSource,
   acquireClipboardText,
   showTextReviewOverlay,
@@ -201,13 +198,9 @@ export async function runAnnotateCommand(
   let source: TextReviewSource | undefined;
   switch (kind) {
     case "last":
-      source = sourceDependencies.getLatestAssistantReply(ctx);
-      if (!source) {
-        ctx.ui.notify(
-          "No non-empty assistant reply is available on the active session branch.",
-          "warning",
-        );
-      }
+      source = await sourceDependencies.selectSessionTextReviewSource(ctx, {
+        autoSelect: "latest-assistant",
+      });
       break;
     case "session":
       source = await sourceDependencies.selectSessionTextReviewSource(ctx);
