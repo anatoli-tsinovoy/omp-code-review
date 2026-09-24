@@ -1,5 +1,8 @@
 # OMP Code Review
 
+Do not install this, this exists in omp 18.3.0 as the bundled /annotate command.
+
+
 `/annotate code-review` is an interactive local-diff review workspace for [Oh My Pi](https://github.com/can1357/oh-my-pi). Select a diff, navigate its files and source lines, attach precise inline notes, then either continue the review with the active LLM session or place the annotations in the editor for further editing. The review uses one frozen diff snapshot, so its annotations and submitted context refer to the same changes.
 
 `/annotate` offers one source menu for code review, assistant replies, session messages and blocks, and clipboard text. Text annotation works outside Git repositories.
